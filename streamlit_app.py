@@ -670,7 +670,8 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     hovermode="x unified",
 )
-fig.add_vline(x=latest_month.isoformat(), line_dash="dash", line_color="gray", annotation_text="Current", annotation_position="top")
+fig.add_shape(type="line", x0=latest_month.isoformat(), x1=latest_month.isoformat(), y0=0, y1=1, yref="paper", line=dict(color="gray", dash="dash"))
+fig.add_annotation(x=latest_month.isoformat(), y=1, yref="paper", text="Current", showarrow=False, yanchor="bottom")
 st.plotly_chart(fig, use_container_width=True)
 
 # =============================================================================
