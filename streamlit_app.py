@@ -319,6 +319,15 @@ def _safe_team_mean(df, team, col):
     return vals.mean() if not vals.empty else 0.0
 
 
+def _safe_team_monthly_total(df, team, month_col, value_col):
+    """Average of monthly TOTALS (sum across lead sources per month, then average)."""
+    subset = df[df["TEAM_NAME"] == team] if "TEAM_NAME" in df.columns else df
+    if subset.empty or value_col not in subset.columns:
+        return 0.0
+    monthly = subset.groupby(month_col)[value_col].sum()
+    return monthly.mean() if not monthly.empty else 0.0
+
+
 def _safe_team_conv(df, team):
     subset = df[df["TEAM_NAME"] == team]
     if subset.empty:
@@ -365,7 +374,7 @@ def compute_historical_defaults(data):
     defaults["ISAS"] = {
         "mqls_per_month": round(_safe_mean(mql_recent, "Vello", "LEADS"), 0),
         "mql_conversion_rate": round(_safe_mean(mql_recent, "Vello", "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-        "sqls_per_month": round(_safe_team_mean(sqls_recent, "ISAS", "SQLS_CREATED"), 0),
+        "sqls_per_month": round(_safe_team_monthly_total(sqls_recent, "ISAS", "MONTH", "SQLS_CREATED"), 0),
         "sql_conversion_rate": round(_safe_team_conv(conv_latest, "ISAS"), 1),
         "time_to_sale_days": round(_safe_team_mean(ttb_recent, "ISAS", "MEDIAN_DAYS_TO_BOOKING"), 0),
         "time_to_implement_days": round(ttp_median, 0),
@@ -376,7 +385,7 @@ def compute_historical_defaults(data):
     defaults["SOFTWARE SALES"] = {
         "mqls_per_month": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEADS") + _safe_mean(mql_recent, "Vello", "LEADS"), 0),
         "mql_conversion_rate": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-        "sqls_per_month": round(_safe_team_mean(sqls_recent, "SOFTWARE SALES", "SQLS_CREATED"), 0),
+        "sqls_per_month": round(_safe_team_monthly_total(sqls_recent, "SOFTWARE SALES", "MONTH", "SQLS_CREATED"), 0),
         "sql_conversion_rate": round(_safe_team_conv(conv_latest, "SOFTWARE SALES"), 1),
         "vello_attach_rate": round(vello_attach, 1),
         "time_to_sale_days": round(_safe_team_mean(ttb_recent, "SOFTWARE SALES", "MEDIAN_DAYS_TO_BOOKING"), 0),
@@ -388,7 +397,7 @@ def compute_historical_defaults(data):
     defaults["ESAM"] = {
         "mqls_per_month": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEADS"), 0),
         "mql_conversion_rate": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-        "sqls_per_month": round(_safe_team_mean(sqls_recent, "ESAM", "SQLS_CREATED"), 0),
+        "sqls_per_month": round(_safe_team_monthly_total(sqls_recent, "ESAM", "MONTH", "SQLS_CREATED"), 0),
         "sql_conversion_rate": round(_safe_team_conv(conv_latest, "ESAM"), 1),
         "vello_attach_rate": 100.0,
         "time_to_sale_days": round(_safe_team_mean(ttb_recent, "ESAM", "MEDIAN_DAYS_TO_BOOKING"), 0),
