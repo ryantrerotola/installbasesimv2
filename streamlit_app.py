@@ -4,7 +4,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import snowflake.connector
+from snowflake.snowpark.context import get_active_session
 from dateutil.relativedelta import relativedelta
 
 # =============================================================================
@@ -207,26 +207,15 @@ ORDER BY 3, 2, 1
 # =============================================================================
 # DATA LOADING
 # =============================================================================
-def get_snowflake_connection():
-    return snowflake.connector.connect(
-        account=st.secrets["snowflake"]["account"],
-        user=st.secrets["snowflake"]["user"],
-        password=st.secrets["snowflake"]["password"],
-        warehouse=st.secrets["snowflake"]["warehouse"],
-        database=st.secrets["snowflake"]["database"],
-        schema=st.secrets["snowflake"]["schema"],
-        role=st.secrets["snowflake"]["role"],
-    )
+def get_session():
+    return get_active_session()
 
 
 def _run_query(query: str) -> pd.DataFrame:
-    conn = get_snowflake_connection()
-    try:
-        df = pd.read_sql(query, conn)
-        df.columns = [c.upper() for c in df.columns]
-        return df
-    finally:
-        conn.close()
+    session = get_session()
+    df = session.sql(query).to_pandas()
+    df.columns = [c.upper() for c in df.columns]
+    return df
 
 
 TEAM_RENAME = {"SOFTWARE SALES EAST": "SOFTWARE SALES", "SOFTWARE SALES WEST": "SOFTWARE SALES"}
