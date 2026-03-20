@@ -11,6 +11,7 @@ from dateutil.relativedelta import relativedelta
 # CONFIG
 # =============================================================================
 ALL_TEAMS = ["ISAS", "SOFTWARE SALES", "ESAM"]
+LEAD_SOURCES = ["VDC", "Other Leads"]
 PROJECTION_YEARS = 5
 MONTE_CARLO_SIMULATIONS = 1000
 CONFIDENCE_LEVEL = 0.90
@@ -336,6 +337,33 @@ def _safe_team_conv(df, team):
     return (100.0 * subset["WINS"].sum() / total_resolved) if total_resolved > 0 else 0.0
 
 
+def _safe_team_ls_monthly_total(df, team, lead_source, month_col, value_col):
+    """Average monthly total for a specific team + lead source."""
+    subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if subset.empty or value_col not in subset.columns:
+        return 0.0
+    monthly = subset.groupby(month_col)[value_col].sum()
+    return monthly.mean() if not monthly.empty else 0.0
+
+
+def _safe_team_ls_conv(df, team, lead_source):
+    """Conversion rate for a specific team + lead source."""
+    subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if subset.empty:
+        return 0.0
+    total_resolved = subset["RESOLVED_TOTAL"].sum()
+    return (100.0 * subset["WINS"].sum() / total_resolved) if total_resolved > 0 else 0.0
+
+
+def _safe_team_ls_mean(df, team, lead_source, col):
+    """Mean of a column for a specific team + lead source."""
+    subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if subset.empty or col not in subset.columns:
+        return 0.0
+    vals = subset[col].dropna()
+    return vals.mean() if not vals.empty else 0.0
+
+
 def compute_historical_defaults(data):
     defaults = {}
     recent_months = 6
@@ -370,40 +398,39 @@ def compute_historical_defaults(data):
 
     ttp_median = ttp_recent["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not ttp_recent.empty else 90.0
 
-    # ISAS
-    defaults["ISAS"] = {
-        "mqls_per_month": round(_safe_mean(mql_recent, "Vello", "LEADS"), 0),
-        "mql_conversion_rate": round(_safe_mean(mql_recent, "Vello", "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-        "sqls_per_month": round(_safe_team_monthly_total(sqls_recent, "ISAS", "MONTH", "SQLS_CREATED"), 0),
-        "sql_conversion_rate": round(_safe_team_conv(conv_latest, "ISAS"), 1),
-        "time_to_sale_days": round(_safe_team_mean(ttb_recent, "ISAS", "MEDIAN_DAYS_TO_BOOKING"), 0),
-        "time_to_implement_days": round(ttp_median, 0),
-        "monthly_churn_rate": round(monthly_churn_rate * 100, 2),
+    # MQL mappings per team (informational only)
+    mql_map = {
+        "ISAS": {"product_group": "Vello"},
+        "SOFTWARE SALES": {"product_group": "ezyVet + Neo"},
+        "ESAM": {"product_group": "ezyVet + Neo"},
+    }
+    attach_map = {
+        "SOFTWARE SALES": round(vello_attach, 1),
+        "ESAM": 100.0,
     }
 
-    # SOFTWARE SALES
-    defaults["SOFTWARE SALES"] = {
-        "mqls_per_month": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEADS") + _safe_mean(mql_recent, "Vello", "LEADS"), 0),
-        "mql_conversion_rate": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-        "sqls_per_month": round(_safe_team_monthly_total(sqls_recent, "SOFTWARE SALES", "MONTH", "SQLS_CREATED"), 0),
-        "sql_conversion_rate": round(_safe_team_conv(conv_latest, "SOFTWARE SALES"), 1),
-        "vello_attach_rate": round(vello_attach, 1),
-        "time_to_sale_days": round(_safe_team_mean(ttb_recent, "SOFTWARE SALES", "MEDIAN_DAYS_TO_BOOKING"), 0),
-        "time_to_implement_days": round(ttp_median if not ttp_recent.empty else 120.0, 0),
-        "monthly_churn_rate": round(monthly_churn_rate * 100, 2),
-    }
+    for team in ALL_TEAMS:
+        pg = mql_map[team]["product_group"]
+        has_attach = team in attach_map
+        team_defaults = {
+            "mqls_per_month": round(_safe_mean(mql_recent, pg, "LEADS"), 0),
+            "mql_conversion_rate": round(_safe_mean(mql_recent, pg, "LEAD_TO_OPP_CONVERSION_PCT"), 1),
+            "time_to_implement_days": round(ttp_median if not ttp_recent.empty else (90.0 if team == "ISAS" else 120.0), 0),
+            "monthly_churn_rate": round(monthly_churn_rate * 100, 2),
+        }
+        if has_attach:
+            team_defaults["vello_attach_rate"] = attach_map[team]
 
-    # ESAM
-    defaults["ESAM"] = {
-        "mqls_per_month": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEADS"), 0),
-        "mql_conversion_rate": round(_safe_mean(mql_recent, "ezyVet + Neo", "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-        "sqls_per_month": round(_safe_team_monthly_total(sqls_recent, "ESAM", "MONTH", "SQLS_CREATED"), 0),
-        "sql_conversion_rate": round(_safe_team_conv(conv_latest, "ESAM"), 1),
-        "vello_attach_rate": 100.0,
-        "time_to_sale_days": round(_safe_team_mean(ttb_recent, "ESAM", "MEDIAN_DAYS_TO_BOOKING"), 0),
-        "time_to_implement_days": round(ttp_median if not ttp_recent.empty else 120.0, 0),
-        "monthly_churn_rate": round(monthly_churn_rate * 100, 2),
-    }
+        # Per lead-source defaults
+        ls_defaults = {}
+        for ls in LEAD_SOURCES:
+            ls_defaults[ls] = {
+                "sqls_per_month": round(_safe_team_ls_monthly_total(sqls_recent, team, ls, "MONTH", "SQLS_CREATED"), 0),
+                "sql_conversion_rate": round(_safe_team_ls_conv(conv_latest, team, ls), 1),
+                "time_to_sale_days": round(_safe_team_ls_mean(ttb_recent, team, ls, "MEDIAN_DAYS_TO_BOOKING"), 0) or round(_safe_team_mean(ttb_recent, team, "MEDIAN_DAYS_TO_BOOKING"), 0),
+            }
+        team_defaults["lead_sources"] = ls_defaults
+        defaults[team] = team_defaults
 
     return defaults
 
@@ -421,37 +448,45 @@ def compute_run_rate_params(data):
     ttp = data["time_to_placement"]
     ttp_recent = ttp[ttp["MONTH"] >= ttp["MONTH"].max() - pd.DateOffset(months=recent_months)]
     placements = data["vello_placements"]
+    ttp_impl_days = ttp_recent["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not ttp_recent.empty else 90
 
     for team in ALL_TEAMS:
-        team_sqls = sqls[sqls["TEAM_NAME"] == team]
-        team_recent = team_sqls[team_sqls["MONTH"] >= team_sqls["MONTH"].max() - pd.DateOffset(months=recent_months)]
-        monthly_sqls = team_recent.groupby("MONTH")["SQLS_CREATED"].sum()
+        # Compute team-level attach rate (shared across lead sources)
+        team_sqls_all = sqls[sqls["TEAM_NAME"] == team]
+        team_recent_all = team_sqls_all[team_sqls_all["MONTH"] >= team_sqls_all["MONTH"].max() - pd.DateOffset(months=recent_months)]
+        monthly_sqls_all = team_recent_all.groupby("MONTH")["SQLS_CREATED"].sum()
+        team_conv_all = conv[(conv["TEAM_NAME"] == team) & (conv["REPORTING_MONTH"] == latest_month)]
+        conv_rate_all = team_conv_all["WINS"].sum() / max(team_conv_all["RESOLVED_TOTAL"].sum(), 1)
 
-        team_conv = conv[(conv["TEAM_NAME"] == team) & (conv["REPORTING_MONTH"] == latest_month)]
-        conv_rate = team_conv["WINS"].sum() / max(team_conv["RESOLVED_TOTAL"].sum(), 1)
-
-        team_ttb = ttb[(ttb["TEAM_NAME"] == team) & (ttb["MONTH"] >= ttb["MONTH"].max() - pd.DateOffset(months=recent_months))]
-
-        # Attach rate
         if team == "SOFTWARE SALES":
             plc_recent = placements[placements["MONTH"] >= placements["MONTH"].max() - pd.DateOffset(months=recent_months)] if not placements.empty else placements
             monthly_plc = plc_recent["VELLO_PLACEMENTS"].mean() if not plc_recent.empty else 0
-            ss_monthly_wins = (conv_rate * monthly_sqls.mean()) if not monthly_sqls.empty else 1
+            ss_monthly_wins = (conv_rate_all * monthly_sqls_all.mean()) if not monthly_sqls_all.empty else 1
             attach = min(monthly_plc / max(ss_monthly_wins, 1), 1.0)
         elif team == "ISAS":
             attach = 1.0
         else:
             attach = 1.0
 
-        params[team] = {
-            "sqls_mean": monthly_sqls.mean() if not monthly_sqls.empty else 0,
-            "sqls_std": max(monthly_sqls.std(), 1) if not monthly_sqls.empty else 1,
-            "conv_rate": conv_rate,
-            "conv_rate_std": 0.03,
-            "time_to_sale_days": team_ttb["MEDIAN_DAYS_TO_BOOKING"].mean() if not team_ttb.empty else 60,
-            "time_to_implement_days": ttp_recent["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not ttp_recent.empty else 90,
-            "attach_rate": attach,
-        }
+        for ls in LEAD_SOURCES:
+            ls_sqls = sqls[(sqls["TEAM_NAME"] == team) & (sqls["LEAD_SOURCE_GROUP"] == ls)]
+            ls_recent = ls_sqls[ls_sqls["MONTH"] >= ls_sqls["MONTH"].max() - pd.DateOffset(months=recent_months)] if not ls_sqls.empty else ls_sqls
+            monthly = ls_recent.groupby("MONTH")["SQLS_CREATED"].sum() if not ls_recent.empty else pd.Series(dtype=float)
+
+            ls_conv = conv[(conv["TEAM_NAME"] == team) & (conv["LEAD_SOURCE_GROUP"] == ls) & (conv["REPORTING_MONTH"] == latest_month)]
+            cr = ls_conv["WINS"].sum() / max(ls_conv["RESOLVED_TOTAL"].sum(), 1)
+
+            ls_ttb = ttb[(ttb["TEAM_NAME"] == team) & (ttb["LEAD_SOURCE_GROUP"] == ls) & (ttb["MONTH"] >= ttb["MONTH"].max() - pd.DateOffset(months=recent_months))]
+
+            params[(team, ls)] = {
+                "sqls_mean": monthly.mean() if not monthly.empty else 0,
+                "sqls_std": max(monthly.std(), 1) if not monthly.empty else 1,
+                "conv_rate": cr,
+                "conv_rate_std": 0.03,
+                "time_to_sale_days": ls_ttb["MEDIAN_DAYS_TO_BOOKING"].mean() if not ls_ttb.empty else 60,
+                "time_to_implement_days": ttp_impl_days,
+                "attach_rate": attach,
+            }
 
     # Churn
     churns = data["churns"]
@@ -533,9 +568,10 @@ def run_monte_carlo(
 
 
 def run_scenario_simulation(starting_install_base, scenario_params, churn_rate_mean, churn_rate_std, lead_growth_rate=0.0, projection_months=PROJECTION_YEARS * 12, n_simulations=MONTE_CARLO_SIMULATIONS):
+    """scenario_params is keyed by (team, lead_source) tuples."""
     team_params = {}
-    for team_name, sp in scenario_params.items():
-        team_params[team_name] = {
+    for key, sp in scenario_params.items():
+        team_params[key] = {
             "sqls_mean": sp["sqls_per_month"],
             "sqls_std": sp["sqls_per_month"] * 0.15,
             "conv_rate": sp["sql_conversion_rate"] / 100.0,
@@ -568,7 +604,7 @@ run_rate_params = compute_run_rate_params(data)
 defaults = compute_historical_defaults(data)
 churn_mean = run_rate_params["churn_rate_mean"]
 churn_std = run_rate_params["churn_rate_std"]
-baseline_team_params = {k: v for k, v in run_rate_params.items() if k not in ("churn_rate_mean", "churn_rate_std")}
+baseline_team_params = {k: v for k, v in run_rate_params.items() if k not in ("churn_rate_mean", "churn_rate_std") and isinstance(k, tuple)}
 
 projection_months = PROJECTION_YEARS * 12
 baseline_result = run_monte_carlo(latest_ib, baseline_team_params, churn_mean, churn_std, projection_months)
@@ -599,39 +635,56 @@ def scenario_planner_modal():
     for tab, team in zip(team_tabs, ALL_TEAMS):
         with tab:
             d = defaults.get(team, {})
+            ls_defaults = d.get("lead_sources", {})
             has_attach = team in ("SOFTWARE SALES", "ESAM")
             st.markdown(f"**{team}** — adjust the levers below")
-            c1, c2 = st.columns(2)
 
-            with c1:
+            # Team-level shared inputs
+            shared_c1, shared_c2, shared_c3 = st.columns(3)
+            with shared_c1:
                 mqls = st.number_input("MQLs / Month", min_value=0, max_value=5000, value=int(d.get("mqls_per_month", 100)), step=10, key=f"{team}_mqls")
-                mql_conv = st.slider("MQL → SQL Conversion Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("mql_conversion_rate", 10.0)), step=0.5, key=f"{team}_mql_conv", help="Informational — SQLs are set independently since MQL-to-SQL mapping isn't 1:1")
-                sqls = st.number_input("SQLs / Month", min_value=0, max_value=2000, value=int(d.get("sqls_per_month", 50)), step=5, key=f"{team}_sqls")
-
-            with c2:
-                sql_conv = st.slider("SQL Win Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("sql_conversion_rate", 20.0)), step=0.5, key=f"{team}_sql_conv")
-                tts = st.number_input("Time to Sale (days)", min_value=1, max_value=730, value=int(d.get("time_to_sale_days", 60)), step=5, key=f"{team}_tts")
+                mql_conv = st.slider("MQL → SQL Conv (%)", min_value=0.0, max_value=100.0, value=float(d.get("mql_conversion_rate", 10.0)), step=0.5, key=f"{team}_mql_conv", help="Informational — SQLs are set independently since MQL-to-SQL mapping isn't 1:1")
+            with shared_c2:
                 tti = st.number_input("Time to Implement (days)", min_value=1, max_value=2000, value=int(d.get("time_to_implement_days", 90)), step=5, key=f"{team}_tti")
+            with shared_c3:
+                attach = 100.0
+                if has_attach:
+                    attach = st.slider("Vello Attach Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("vello_attach_rate", 30.0)), step=1.0, key=f"{team}_attach", help="% of converted deals that include Vello")
 
-            attach = 100.0
-            if has_attach:
-                attach = st.slider("Vello Attach Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("vello_attach_rate", 30.0)), step=1.0, key=f"{team}_attach", help="% of converted deals that include Vello")
+            st.divider()
 
-            monthly_wins = sqls * (sql_conv / 100.0) * (attach / 100.0)
+            # Per lead-source inputs side by side
+            ls_cols = st.columns(len(LEAD_SOURCES))
+            total_monthly_wins = 0
+            ls_details = []
+
+            for col, ls in zip(ls_cols, LEAD_SOURCES):
+                with col:
+                    ls_d = ls_defaults.get(ls, {})
+                    ls_label = "VDC (IDEXX Referrals)" if ls == "VDC" else "Other Leads"
+                    st.markdown(f"**{ls_label}**")
+                    sqls = st.number_input("SQLs / Month", min_value=0, max_value=2000, value=int(ls_d.get("sqls_per_month", 0)), step=5, key=f"{team}_{ls}_sqls")
+                    sql_conv = st.slider("SQL Win Rate (%)", min_value=0.0, max_value=100.0, value=float(ls_d.get("sql_conversion_rate", 10.0)), step=0.5, key=f"{team}_{ls}_sql_conv")
+                    tts = st.number_input("Time to Sale (days)", min_value=1, max_value=730, value=max(int(ls_d.get("time_to_sale_days", 60)), 1), step=5, key=f"{team}_{ls}_tts")
+
+                    wins = sqls * (sql_conv / 100.0) * (attach / 100.0)
+                    total_monthly_wins += wins
+                    ls_details.append(f"{ls}: {sqls} SQLs × {sql_conv:.1f}%")
+
+                    scenario_params[(team, ls)] = {
+                        "sqls_per_month": sqls,
+                        "sql_conversion_rate": sql_conv,
+                        "time_to_sale_days": tts,
+                        "time_to_implement_days": tti,
+                        "vello_attach_rate": attach,
+                    }
+
             st.info(
                 f"**Projected monthly Vello placements from {team}:** "
-                f"{sqls} SQLs × {sql_conv:.1f}% win rate"
+                + " + ".join(ls_details)
                 + (f" × {attach:.1f}% attach" if has_attach else "")
-                + f" = **{monthly_wins:.1f}** placements/month (after ~{tts + tti} day lag)"
+                + f" = **{total_monthly_wins:.1f}** placements/month"
             )
-
-            scenario_params[team] = {
-                "sqls_per_month": sqls,
-                "sql_conversion_rate": sql_conv,
-                "time_to_sale_days": tts,
-                "time_to_implement_days": tti,
-                "vello_attach_rate": attach,
-            }
 
     st.divider()
     if st.button("Run Simulation", type="primary", use_container_width=True):
