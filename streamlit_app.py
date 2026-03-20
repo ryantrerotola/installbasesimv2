@@ -670,7 +670,7 @@ fig.update_layout(
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     hovermode="x unified",
 )
-fig.add_vline(x=latest_month, line_dash="dash", line_color="gray", annotation_text="Current", annotation_position="top")
+fig.add_vline(x=latest_month.isoformat(), line_dash="dash", line_color="gray", annotation_text="Current", annotation_position="top")
 st.plotly_chart(fig, use_container_width=True)
 
 # =============================================================================
