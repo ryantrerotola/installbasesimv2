@@ -601,8 +601,8 @@ def scenario_planner_modal():
 
             with c2:
                 sql_conv = st.slider("SQL Win Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("sql_conversion_rate", 20.0)), step=0.5, key=f"{team}_sql_conv")
-                tts = st.number_input("Time to Sale (days)", min_value=1, max_value=365, value=int(d.get("time_to_sale_days", 60)), step=5, key=f"{team}_tts")
-                tti = st.number_input("Time to Implement (days)", min_value=1, max_value=365, value=int(d.get("time_to_implement_days", 90)), step=5, key=f"{team}_tti")
+                tts = st.number_input("Time to Sale (days)", min_value=1, max_value=730, value=int(d.get("time_to_sale_days", 60)), step=5, key=f"{team}_tts")
+                tti = st.number_input("Time to Implement (days)", min_value=1, max_value=2000, value=int(d.get("time_to_implement_days", 90)), step=5, key=f"{team}_tti")
 
             attach = 100.0
             if has_attach:
