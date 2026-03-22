@@ -705,7 +705,7 @@ def scenario_planner_modal():
 if st.button("Create Scenario", type="primary"):
     scenario_planner_modal()
 
-tab_projections, tab_distribution = st.tabs(["Projections", "Monte Carlo Distribution"])
+tab_projections, tab_distribution, tab_goalsek = st.tabs(["Projections", "Monte Carlo Distribution", "Goal Seek"])
 
 # =============================================================================
 # TAB 1 — PROJECTIONS
@@ -857,6 +857,249 @@ with tab_distribution:
         template="plotly_white",
     )
     st.plotly_chart(box_fig, use_container_width=True)
+
+# =============================================================================
+# GOAL SEEK ENGINE
+# =============================================================================
+def _compute_sensitivity(baseline_params, churn_mean, churn_std, starting_ib, target_month,
+                         seasonal_indices, start_cal_month, n_sims=200):
+    """Compute marginal impact of each lever: how many sites does a 1% change add at target_month?"""
+    base_result = run_monte_carlo(starting_ib, baseline_params, churn_mean, churn_std,
+                                  target_month, n_sims, seasonality=seasonal_indices,
+                                  start_calendar_month=start_cal_month)
+    base_median = np.median(base_result["raw"][:, -1])
+
+    sensitivities = []
+
+    # Test each segment's levers
+    for key, p in baseline_params.items():
+        if not isinstance(key, tuple):
+            continue
+        team, ls = key
+
+        # SQLs: +1% increase
+        tweaked = {k: dict(v) if isinstance(v, dict) else v for k, v in baseline_params.items()}
+        tweaked[key] = dict(p)
+        tweaked[key]["sqls_mean"] = p["sqls_mean"] * 1.01
+        tweaked[key]["sqls_std"] = p["sqls_std"] * 1.01
+        r = run_monte_carlo(starting_ib, tweaked, churn_mean, churn_std, target_month, n_sims,
+                            seasonality=seasonal_indices, start_calendar_month=start_cal_month)
+        sql_impact = np.median(r["raw"][:, -1]) - base_median
+        sensitivities.append({
+            "lever": "SQLs/month", "team": team, "ls": ls,
+            "current": p["sqls_mean"], "unit": "leads",
+            "impact_per_pct": sql_impact, "key": key, "param": "sqls",
+        })
+
+        # Win rate: +1pp
+        tweaked = {k: dict(v) if isinstance(v, dict) else v for k, v in baseline_params.items()}
+        tweaked[key] = dict(p)
+        tweaked[key]["conv_rate"] = p["conv_rate"] + 0.01
+        r = run_monte_carlo(starting_ib, tweaked, churn_mean, churn_std, target_month, n_sims,
+                            seasonality=seasonal_indices, start_calendar_month=start_cal_month)
+        cr_impact = np.median(r["raw"][:, -1]) - base_median
+        sensitivities.append({
+            "lever": "Win Rate", "team": team, "ls": ls,
+            "current": p["conv_rate"] * 100, "unit": "pp",
+            "impact_per_pct": cr_impact, "key": key, "param": "conv_rate",
+        })
+
+        # Attach rate: +1pp (skip ISAS, always 100%)
+        if team != "ISAS":
+            tweaked = {k: dict(v) if isinstance(v, dict) else v for k, v in baseline_params.items()}
+            tweaked[key] = dict(p)
+            tweaked[key]["attach_rate"] = min(p["attach_rate"] + 0.01, 1.0)
+            r = run_monte_carlo(starting_ib, tweaked, churn_mean, churn_std, target_month, n_sims,
+                                seasonality=seasonal_indices, start_calendar_month=start_cal_month)
+            att_impact = np.median(r["raw"][:, -1]) - base_median
+            sensitivities.append({
+                "lever": "Attach Rate", "team": team, "ls": ls,
+                "current": p["attach_rate"] * 100, "unit": "pp",
+                "impact_per_pct": att_impact, "key": key, "param": "attach_rate",
+            })
+
+    # Churn: -1pp (reducing churn = good)
+    r = run_monte_carlo(starting_ib, baseline_params, churn_mean - 0.0001, churn_std, target_month, n_sims,
+                        seasonality=seasonal_indices, start_calendar_month=start_cal_month)
+    churn_impact = np.median(r["raw"][:, -1]) - base_median  # impact of -0.01pp
+    sensitivities.append({
+        "lever": "Churn Rate", "team": "ALL", "ls": "ALL",
+        "current": churn_mean * 100, "unit": "pp reduction",
+        "impact_per_pct": churn_impact * 100,  # scale to per-1pp
+        "key": "churn", "param": "churn",
+    })
+
+    return base_median, sensitivities
+
+
+def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
+               target_month, seasonal_indices, start_cal_month, locked_levers=None,
+               max_iterations=20, n_sims=200):
+    """
+    Find the path-of-least-resistance parameter changes to hit target_ib at target_month.
+
+    Uses iterative gradient-based optimization with quadratic cost penalty:
+    - Each lever's "cost" grows quadratically with % change (small changes are cheap, big ones expensive)
+    - Distributes effort across many levers rather than concentrating on one
+    - Respects locked_levers (set of lever identifiers to skip)
+    """
+    if locked_levers is None:
+        locked_levers = set()
+
+    # Get baseline and sensitivities
+    base_median, sensitivities = _compute_sensitivity(
+        baseline_params, churn_mean, churn_std, starting_ib, target_month,
+        seasonal_indices, start_cal_month, n_sims,
+    )
+
+    gap = target_ib - base_median
+    if abs(gap) < 1:
+        return base_median, [], sensitivities, "on_target"
+
+    # Filter out locked levers and zero-impact levers
+    active = [s for s in sensitivities
+              if (s["team"], s["ls"], s["lever"]) not in locked_levers
+              and abs(s["impact_per_pct"]) > 0.01]
+
+    if not active:
+        return base_median, [], sensitivities, "no_levers"
+
+    # Allocate changes proportional to sensitivity, with quadratic cost balancing
+    # Higher sensitivity levers get more change, but penalized quadratically
+    # This naturally spreads effort across levers
+    total_sensitivity = sum(abs(s["impact_per_pct"]) for s in active)
+    if total_sensitivity == 0:
+        return base_median, [], sensitivities, "no_impact"
+
+    recommendations = []
+    remaining_gap = gap
+    allocated = {id(s): 0.0 for s in active}
+
+    for iteration in range(max_iterations):
+        if abs(remaining_gap) < 1:
+            break
+
+        # Weight by sensitivity / (1 + change_so_far^2) — quadratic penalty
+        weights = []
+        for s in active:
+            change_so_far = abs(allocated[id(s)])
+            penalty = 1.0 + (change_so_far ** 2) * 4.0  # steeper penalty for large changes
+            direction = 1.0 if (remaining_gap > 0) == (s["impact_per_pct"] > 0) else -1.0
+            if s["param"] == "churn":
+                direction = -1.0 if remaining_gap > 0 else 1.0  # reduce churn to grow
+            effective_weight = abs(s["impact_per_pct"]) / penalty
+            weights.append((s, effective_weight, direction))
+
+        total_weight = sum(w for _, w, _ in weights)
+        if total_weight == 0:
+            break
+
+        # Allocate a step — take 30% of remaining gap per iteration for stability
+        step_fraction = min(0.3, 1.0 / max(iteration + 1, 1))
+        step_gap = remaining_gap * step_fraction
+
+        for s, w, direction in weights:
+            share = (w / total_weight) * abs(step_gap)
+            pct_change = share / abs(s["impact_per_pct"]) if abs(s["impact_per_pct"]) > 0.01 else 0
+            # Clamp individual step
+            pct_change = min(pct_change, 5.0)  # max 5 units per step
+            allocated[id(s)] += pct_change * direction
+
+        # Re-estimate remaining gap
+        filled = sum(allocated[id(s)] * s["impact_per_pct"] for s in active)
+        remaining_gap = gap - filled
+
+    # Build recommendations from allocations
+    for s in active:
+        change = allocated[id(s)]
+        if abs(change) < 0.01:
+            continue
+
+        if s["param"] == "sqls":
+            new_val = s["current"] * (1 + change / 100.0)
+            pct_change = change
+            rec = {
+                "team": s["team"], "ls": s["ls"], "lever": s["lever"],
+                "current": round(s["current"], 1), "recommended": round(max(new_val, 0), 1),
+                "change": f"{pct_change:+.1f}%", "change_raw": abs(pct_change),
+                "impact": round(abs(change * s["impact_per_pct"]), 0),
+                "unit": "leads/mo",
+            }
+        elif s["param"] == "conv_rate":
+            new_val = s["current"] + change
+            rec = {
+                "team": s["team"], "ls": s["ls"], "lever": s["lever"],
+                "current": round(s["current"], 1), "recommended": round(min(max(new_val, 0), 100), 1),
+                "change": f"{change:+.1f}pp", "change_raw": abs(change),
+                "impact": round(abs(change * s["impact_per_pct"]), 0),
+                "unit": "%",
+            }
+        elif s["param"] == "attach_rate":
+            new_val = s["current"] + change
+            rec = {
+                "team": s["team"], "ls": s["ls"], "lever": s["lever"],
+                "current": round(s["current"], 1), "recommended": round(min(max(new_val, 0), 100), 1),
+                "change": f"{change:+.1f}pp", "change_raw": abs(change),
+                "impact": round(abs(change * s["impact_per_pct"]), 0),
+                "unit": "%",
+            }
+        elif s["param"] == "churn":
+            new_val = s["current"] + change
+            rec = {
+                "team": s["team"], "ls": s["ls"], "lever": s["lever"],
+                "current": round(s["current"], 3), "recommended": round(max(new_val, 0), 3),
+                "change": f"{change:+.3f}pp", "change_raw": abs(change),
+                "impact": round(abs(change * s["impact_per_pct"]), 0),
+                "unit": "%",
+            }
+        else:
+            continue
+
+        recommendations.append(rec)
+
+    # Sort by change magnitude (smallest first — path of least resistance)
+    recommendations.sort(key=lambda r: r["change_raw"])
+
+    projected = base_median + sum(allocated[id(s)] * s["impact_per_pct"] for s in active)
+
+    # Determine feasibility
+    if abs(projected - target_ib) / max(target_ib, 1) < 0.02:
+        status = "achievable"
+    elif abs(projected - target_ib) / max(target_ib, 1) < 0.10:
+        status = "stretch"
+    else:
+        status = "difficult"
+
+    return projected, recommendations, sensitivities, status
+
+
+def _build_goalsek_params(recommendations, baseline_params, churn_mean):
+    """Build modified params dict from goal seek recommendations for validation simulation."""
+    params = {k: dict(v) if isinstance(v, dict) else v for k, v in baseline_params.items()}
+    new_churn = churn_mean
+
+    for rec in recommendations:
+        if rec["lever"] == "Churn Rate":
+            new_churn = rec["recommended"] / 100.0
+            continue
+
+        key = (rec["team"], rec["ls"])
+        if key not in params:
+            continue
+        p = dict(params[key])
+
+        if rec["lever"] == "SQLs/month":
+            p["sqls_mean"] = rec["recommended"]
+            p["sqls_std"] = rec["recommended"] * 0.15
+        elif rec["lever"] == "Win Rate":
+            p["conv_rate"] = rec["recommended"] / 100.0
+        elif rec["lever"] == "Attach Rate":
+            p["attach_rate"] = rec["recommended"] / 100.0
+
+        params[key] = p
+
+    return params, new_churn
+
 
 # =============================================================================
 # MATH DECOMPOSITION
@@ -1055,3 +1298,234 @@ with tab_projections:
             st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "COHORT_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
         with ht5:
             st.dataframe(data["vello_attach"].sort_values(["TEAM_NAME", "CLOSE_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
+
+# =============================================================================
+# TAB 3 — GOAL SEEK
+# =============================================================================
+with tab_goalsek:
+    st.subheader("Goal Seek — Path of Least Resistance")
+    st.caption(
+        "Set a target install base and date. The optimizer finds the smallest, "
+        "most distributed changes across all levers to hit your goal."
+    )
+
+    # --- Inputs ---
+    gs_col1, gs_col2 = st.columns(2)
+    with gs_col1:
+        gs_target = st.number_input(
+            "Target Install Base",
+            min_value=latest_ib,
+            max_value=50000,
+            value=latest_ib + 500,
+            step=50,
+            key="gs_target",
+        )
+    with gs_col2:
+        gs_month_options = {
+            (latest_month + relativedelta(months=m)).strftime("%b %Y"): m
+            for m in [6, 12, 18, 24, 36, 48, 60]
+            if m <= projection_months
+        }
+        gs_date_label = st.selectbox("Achieve by", options=list(gs_month_options.keys()), index=1, key="gs_date")
+        gs_target_month = gs_month_options[gs_date_label]
+
+    # --- Constraints: lock levers ---
+    with st.expander("Constraints — lock levers you can't change"):
+        st.caption("Check any levers you want the optimizer to leave alone.")
+        locked = set()
+        constraint_cols = st.columns(len(ALL_TEAMS) + 1)
+
+        for ci, team in enumerate(ALL_TEAMS):
+            with constraint_cols[ci]:
+                st.markdown(f"**{team}**")
+                for ls in LEAD_SOURCES:
+                    if st.checkbox(f"Lock SQLs ({ls})", key=f"lock_{team}_{ls}_sqls"):
+                        locked.add((team, ls, "SQLs/month"))
+                    if st.checkbox(f"Lock Win Rate ({ls})", key=f"lock_{team}_{ls}_cr"):
+                        locked.add((team, ls, "Win Rate"))
+                    if team != "ISAS":
+                        if st.checkbox(f"Lock Attach ({ls})", key=f"lock_{team}_{ls}_att"):
+                            locked.add((team, ls, "Attach Rate"))
+
+        with constraint_cols[-1]:
+            st.markdown("**Global**")
+            if st.checkbox("Lock Churn Rate", key="lock_churn"):
+                locked.add(("ALL", "ALL", "Churn Rate"))
+
+    # --- Run optimizer ---
+    if st.button("Find Optimal Path", type="primary", use_container_width=True, key="gs_run"):
+        with st.spinner(f"Running optimizer ({MONTE_CARLO_SIMULATIONS:,} sims per iteration)..."):
+            projected, recommendations, sensitivities, status = _goal_seek(
+                baseline_team_params, churn_mean, churn_std, starting_ib=latest_ib,
+                target_ib=gs_target, target_month=gs_target_month,
+                seasonal_indices=seasonal_indices, start_cal_month=start_cal_month,
+                locked_levers=locked, max_iterations=15, n_sims=200,
+            )
+        st.session_state.gs_result = {
+            "projected": projected,
+            "recommendations": recommendations,
+            "sensitivities": sensitivities,
+            "status": status,
+            "target": gs_target,
+            "target_month": gs_target_month,
+            "date_label": gs_date_label,
+        }
+
+    # --- Display results ---
+    if "gs_result" not in st.session_state:
+        st.session_state.gs_result = None
+
+    if st.session_state.gs_result is not None:
+        gsr = st.session_state.gs_result
+        projected = gsr["projected"]
+        recommendations = gsr["recommendations"]
+        sensitivities = gsr["sensitivities"]
+        status = gsr["status"]
+        target = gsr["target"]
+        target_month = gsr["target_month"]
+
+        # Feasibility verdict
+        st.divider()
+        gap = target - np.median(baseline_result["raw"][:, min(target_month, projection_months) - 1])
+        run_rate_at_target = np.median(baseline_result["raw"][:, min(target_month, projection_months) - 1])
+
+        if status == "on_target":
+            st.success(f"You're already on track! Run rate projects **{run_rate_at_target:,.0f}** sites by {gsr['date_label']}.")
+        elif status == "achievable":
+            st.success(
+                f"**Achievable.** With small, distributed changes you can reach **{target:,}** sites by {gsr['date_label']}. "
+                f"Run rate alone would reach {run_rate_at_target:,.0f}. Gap: **{gap:+,.0f}** sites."
+            )
+        elif status == "stretch":
+            st.warning(
+                f"**Stretch goal.** The optimizer gets to ~{projected:,.0f} sites (target: {target:,}). "
+                f"Run rate alone: {run_rate_at_target:,.0f}. You'll need aggressive execution across multiple levers."
+            )
+        else:
+            st.error(
+                f"**Very difficult.** Even spreading effort across all levers, the optimizer reaches ~{projected:,.0f} "
+                f"(target: {target:,}). Consider extending the timeline or revising the target."
+            )
+
+        # Gap analysis
+        st.subheader("Gap Analysis")
+        gap_c1, gap_c2, gap_c3 = st.columns(3)
+        gap_c1.metric("Run Rate Projection", f"{run_rate_at_target:,.0f}", help=f"Median at {gsr['date_label']}")
+        gap_c2.metric("Target", f"{target:,}")
+        gap_c3.metric("Gap to Close", f"{gap:+,.0f} sites")
+
+        net_monthly_rr = gap / max(target_month, 1)
+        st.markdown(f"You need **{net_monthly_rr:+,.1f} additional net sites/month** beyond run rate to close this gap over {target_month} months.")
+
+        # Recommendations table
+        if recommendations:
+            st.subheader("Recommended Changes")
+            st.caption("Sorted by size of change (smallest first) — path of least resistance.")
+
+            rec_rows = []
+            for rec in recommendations:
+                label = f"{rec['team']} / {rec['ls']}" if rec['team'] != 'ALL' else "All Teams"
+                rec_rows.append({
+                    "Segment": label,
+                    "Lever": rec["lever"],
+                    "Current": f"{rec['current']:.1f}{rec['unit']}",
+                    "Recommended": f"{rec['recommended']:.1f}{rec['unit']}",
+                    "Change": rec["change"],
+                    "Est. Impact": f"+{rec['impact']:.0f} sites",
+                })
+            st.dataframe(pd.DataFrame(rec_rows), use_container_width=True, hide_index=True)
+
+            # Visual: change magnitudes
+            change_fig = go.Figure()
+            labels = [f"{r['Segment']}\n{r['Lever']}" for r in rec_rows]
+            changes = [r["change_raw"] for r in recommendations]
+            colors = ["#2ca02c" if c < 3 else "#ff7f0e" if c < 8 else "#d62728" for c in changes]
+            change_fig.add_trace(go.Bar(
+                x=labels, y=changes, marker_color=colors,
+                text=[r["change"] for r in recommendations], textposition="outside",
+            ))
+            change_fig.update_layout(
+                title="Change Magnitude by Lever (smaller = easier)",
+                yaxis_title="Magnitude of Change",
+                height=350, template="plotly_white",
+                showlegend=False,
+            )
+            st.plotly_chart(change_fig, use_container_width=True)
+        else:
+            st.info("No parameter changes needed — you're on target or all levers are locked.")
+
+        # Sensitivity ranking
+        st.subheader("Sensitivity Ranking")
+        st.caption("Which levers move the needle the most? Impact of a 1% or 1pp change.")
+        sens_rows = []
+        for s in sorted(sensitivities, key=lambda x: abs(x["impact_per_pct"]), reverse=True):
+            label = f"{s['team']} / {s['ls']}" if s['team'] != 'ALL' else "All Teams"
+            sens_rows.append({
+                "Segment": label,
+                "Lever": s["lever"],
+                "Current Value": f"{s['current']:.1f}",
+                "Impact per 1% / 1pp": f"{s['impact_per_pct']:+.1f} sites",
+            })
+        st.dataframe(pd.DataFrame(sens_rows), use_container_width=True, hide_index=True)
+
+        # Validation simulation — run MC with recommended params
+        if recommendations:
+            st.subheader("Validation — Recommended vs Run Rate")
+            with st.spinner("Running validation simulation..."):
+                rec_params, rec_churn = _build_goalsek_params(recommendations, baseline_team_params, churn_mean)
+                val_result = run_monte_carlo(
+                    latest_ib, rec_params, rec_churn, churn_std,
+                    projection_months, MONTE_CARLO_SIMULATIONS,
+                    seasonality=seasonal_indices, start_calendar_month=start_cal_month,
+                )
+
+            val_fig = go.Figure()
+            val_fig.add_trace(go.Scatter(
+                x=projection_dates, y=baseline_result["median"], mode="lines",
+                name="Run Rate (Median)", line=dict(color="#ff7f0e", width=2, dash="dash"),
+            ))
+            val_fig.add_trace(go.Scatter(
+                x=projection_dates + projection_dates[::-1],
+                y=np.concatenate([baseline_result["p95"], baseline_result["p5"][::-1]]).tolist(),
+                fill="toself", fillcolor="rgba(255, 127, 14, 0.10)",
+                line=dict(color="rgba(255, 127, 14, 0)"), name="Run Rate 90% CI", showlegend=True,
+            ))
+            val_fig.add_trace(go.Scatter(
+                x=projection_dates, y=val_result["median"], mode="lines",
+                name="Goal Seek (Median)", line=dict(color="#9467bd", width=2),
+            ))
+            val_fig.add_trace(go.Scatter(
+                x=projection_dates + projection_dates[::-1],
+                y=np.concatenate([val_result["p95"], val_result["p5"][::-1]]).tolist(),
+                fill="toself", fillcolor="rgba(148, 103, 189, 0.12)",
+                line=dict(color="rgba(148, 103, 189, 0)"), name="Goal Seek 90% CI", showlegend=True,
+            ))
+
+            # Target line
+            target_date = latest_month + relativedelta(months=target_month)
+            val_fig.add_shape(
+                type="line", x0=projection_dates[0].isoformat(), x1=projection_dates[-1].isoformat(),
+                y0=target, y1=target, line=dict(color="red", dash="dot", width=1),
+            )
+            val_fig.add_annotation(
+                x=target_date.isoformat(), y=target, text=f"Target: {target:,}",
+                showarrow=True, arrowhead=2, ax=40, ay=-30,
+                font=dict(color="red"),
+            )
+            val_fig.update_layout(
+                title="Goal Seek Projection vs Run Rate",
+                xaxis_title="Month", yaxis_title="Install Base (Sites)",
+                height=500, template="plotly_white",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+            )
+            st.plotly_chart(val_fig, use_container_width=True)
+
+            # P(hitting target) metric
+            val_at_target = val_result["raw"][:, min(target_month, projection_months) - 1]
+            pct_hit = (val_at_target >= target).mean() * 100
+            rr_at_target = baseline_result["raw"][:, min(target_month, projection_months) - 1]
+            rr_pct_hit = (rr_at_target >= target).mean() * 100
+            pm1, pm2 = st.columns(2)
+            pm1.metric("P(Run Rate hits target)", f"{rr_pct_hit:.0f}%")
+            pm2.metric("P(Goal Seek hits target)", f"{pct_hit:.0f}%")
