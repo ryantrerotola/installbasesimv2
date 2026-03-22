@@ -771,39 +771,59 @@ st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 # =============================================================================
 # MATH DECOMPOSITION
 # =============================================================================
-def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib):
-    """Build a markdown string showing the math behind a projection."""
+def _extract_row(p):
+    """Normalize a param dict to (sqls, conv_rate_decimal, attach_decimal)."""
+    sqls = p.get("sqls_mean", p.get("sqls_per_month", 0))
+    cr = p.get("conv_rate", p.get("sql_conversion_rate", 0) / 100.0)
+    attach = p.get("attach_rate", p.get("vello_attach_rate", 100.0) / 100.0)
+    tts = p.get("time_to_sale_days", 60)
+    tti = p.get("time_to_implement_days", 90)
+    if cr > 1:
+        cr = cr / 100.0
+    if attach > 1:
+        attach = attach / 100.0
+    return sqls, cr, attach, tts, tti
+
+
+def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib, team_defaults):
+    """Build a markdown string showing the full funnel math behind a projection."""
     lines = []
     lines.append(f"### {label}")
     lines.append("")
 
-    # Per team×lead_source breakdown
+    # Full funnel table
+    lines.append("| Team | Lead Source | MQLs/mo | MQL Conv | SQLs/mo | Win Rate | Attach | Wins/mo |")
+    lines.append("|------|------------|---------|----------|---------|----------|--------|---------|")
+
     team_subtotals = {}
     total_gross = 0.0
-    lines.append("| Team | Lead Source | SQLs/mo | Win Rate | Attach | Monthly Wins |")
-    lines.append("|------|------------|---------|----------|--------|-------------|")
+    rows_data = []  # for analysis
+    prev_team = None
 
     for key, p in sorted(params.items(), key=lambda x: x[0]):
         if not isinstance(key, tuple):
             continue
         team, ls = key
-        sqls = p.get("sqls_mean", p.get("sqls_per_month", 0))
-        cr = p.get("conv_rate", p.get("sql_conversion_rate", 0) / 100.0)
-        attach = p.get("attach_rate", p.get("vello_attach_rate", 100.0) / 100.0)
-        # Handle scenario params where rates are in % form
-        if cr > 1:
-            cr = cr / 100.0
-        if attach > 1:
-            attach = attach / 100.0
+        sqls, cr, attach, tts, tti = _extract_row(p)
         wins = sqls * cr * attach
         total_gross += wins
         team_subtotals[team] = team_subtotals.get(team, 0) + wins
-        lines.append(f"| {team} | {ls} | {sqls:.1f} | {cr*100:.1f}% | {attach*100:.0f}% | **{wins:.1f}** |")
+        rows_data.append({"team": team, "ls": ls, "sqls": sqls, "cr": cr, "attach": attach, "wins": wins, "tts": tts, "tti": tti})
+
+        # Show MQLs only on the first row per team
+        td = team_defaults.get(team, {})
+        if team != prev_team:
+            mql_str = f"{int(td.get('mqls_per_month', 0)):,}"
+            mql_conv_str = f"{td.get('mql_conversion_rate', 0):.1f}%"
+        else:
+            mql_str = ""
+            mql_conv_str = ""
+        prev_team = team
+
+        lines.append(f"| {team} | {ls} | {mql_str} | {mql_conv_str} | {sqls:.1f} | {cr*100:.1f}% | {attach*100:.0f}% | **{wins:.1f}** |")
 
     lines.append("")
-
-    # Team subtotals
-    lines.append("**Team subtotals:** " + " + ".join(f"{t} = {w:.1f}" for t, w in team_subtotals.items()))
+    lines.append("**Team subtotals:** " + " | ".join(f"{t} = {w:.1f}" for t, w in team_subtotals.items()))
     lines.append("")
 
     # Net math
@@ -811,7 +831,7 @@ def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib):
     net_monthly = total_gross - monthly_churn_count
     lines.append(f"**Gross adds/month:** {total_gross:.1f} placements")
     lines.append(f"")
-    lines.append(f"**Monthly churn:** {starting_ib:,} install base x {churn_rate*100:.2f}% = {monthly_churn_count:.1f} churns")
+    lines.append(f"**Monthly churn:** {starting_ib:,} x {churn_rate*100:.2f}% = {monthly_churn_count:.1f} churns")
     lines.append(f"")
     lines.append(f"**Net monthly change:** {total_gross:.1f} - {monthly_churn_count:.1f} = **{net_monthly:+.1f}** sites/month")
     if growth_rate != 0:
@@ -820,6 +840,103 @@ def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib):
     lines.append(f"")
     lines.append(f"**Annualized net adds (year 1, approx):** ~{net_monthly * 12:,.0f} sites")
 
+    return "\n".join(lines), rows_data, total_gross, monthly_churn_count, net_monthly
+
+
+def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, scenario_churn, scenario_growth):
+    """Generate natural language analysis comparing run rate to scenario."""
+    rr_rows, rr_gross, rr_churn_ct, rr_net = run_rate_data
+    sc_rows, sc_gross, sc_churn_ct, sc_net = scenario_data
+
+    lines = []
+    lines.append("### What's Driving This Scenario")
+    lines.append("")
+
+    # 1. Overall direction
+    if sc_net > 0 and rr_net <= 0:
+        lines.append("This scenario **flips the install base from decline to growth**. "
+                      f"The run rate loses ~{abs(rr_net):.0f} sites/month, but the scenario adds ~{sc_net:.0f} sites/month.")
+    elif sc_net > rr_net:
+        delta = sc_net - rr_net
+        lines.append(f"This scenario **accelerates growth by {delta:+.0f} sites/month** vs the run rate.")
+    elif sc_net < rr_net:
+        delta = sc_net - rr_net
+        lines.append(f"This scenario **slows growth by {abs(delta):.0f} sites/month** vs the run rate.")
+    else:
+        lines.append("This scenario produces roughly the **same trajectory** as the run rate.")
+    lines.append("")
+
+    # 2. Break down the biggest movers
+    # Build a dict of (team, ls) -> delta_wins
+    rr_map = {(r["team"], r["ls"]): r for r in rr_rows}
+    sc_map = {(r["team"], r["ls"]): r for r in sc_rows}
+    all_keys = set(rr_map.keys()) | set(sc_map.keys())
+
+    deltas = []
+    for k in all_keys:
+        rr_w = rr_map.get(k, {}).get("wins", 0)
+        sc_w = sc_map.get(k, {}).get("wins", 0)
+        delta_w = sc_w - rr_w
+        if abs(delta_w) > 0.05:
+            # Explain why
+            rr_r = rr_map.get(k, {})
+            sc_r = sc_map.get(k, {})
+            reasons = []
+            rr_sqls = rr_r.get("sqls", 0)
+            sc_sqls = sc_r.get("sqls", 0)
+            if sc_sqls != rr_sqls and rr_sqls > 0:
+                pct = (sc_sqls - rr_sqls) / rr_sqls * 100
+                reasons.append(f"SQLs {'up' if pct > 0 else 'down'} {abs(pct):.0f}% ({rr_sqls:.0f} → {sc_sqls:.0f})")
+            rr_cr = rr_r.get("cr", 0)
+            sc_cr = sc_r.get("cr", 0)
+            if abs(sc_cr - rr_cr) > 0.005:
+                reasons.append(f"win rate {'up' if sc_cr > rr_cr else 'down'} ({rr_cr*100:.1f}% → {sc_cr*100:.1f}%)")
+            rr_att = rr_r.get("attach", 1)
+            sc_att = sc_r.get("attach", 1)
+            if abs(sc_att - rr_att) > 0.005:
+                reasons.append(f"attach rate {'up' if sc_att > rr_att else 'down'} ({rr_att*100:.0f}% → {sc_att*100:.0f}%)")
+            deltas.append((k, delta_w, reasons))
+
+    deltas.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    if deltas:
+        lines.append("**Key changes vs run rate:**")
+        lines.append("")
+        for (team, ls), delta_w, reasons in deltas:
+            direction = "more" if delta_w > 0 else "fewer"
+            reason_str = "; ".join(reasons) if reasons else "parameter changes"
+            lines.append(f"- **{team} / {ls}:** {abs(delta_w):+.1f} {direction} wins/month — {reason_str}")
+        lines.append("")
+
+    # 3. Churn comparison
+    if abs(scenario_churn - churn_mean) > 0.0001:
+        churn_delta = (scenario_churn - churn_mean) * starting_ib
+        direction = "higher" if scenario_churn > churn_mean else "lower"
+        lines.append(f"**Churn** is set {direction} than historical ({scenario_churn*100:.2f}% vs {churn_mean*100:.2f}%), "
+                      f"{'adding' if churn_delta > 0 else 'saving'} ~{abs(churn_delta):.0f} sites/month of churn.")
+        lines.append("")
+
+    # 4. Growth rate effect
+    if scenario_growth != 0:
+        yr1_compound = (1 + scenario_growth) ** 12
+        lines.append(f"**SQL growth** of {scenario_growth*100:.1f}%/month means SQLs will be "
+                      f"{yr1_compound:.1f}x current levels in 12 months, significantly "
+                      f"{'accelerating' if scenario_growth > 0 else 'decelerating'} later years.")
+        lines.append("")
+
+    # 5. Sustainability check
+    if sc_net < 0:
+        months_to_lose_10pct = int(0.1 * starting_ib / abs(sc_net)) if sc_net != 0 else 0
+        lines.append(f"At this pace, the install base would shrink ~10% "
+                      f"(lose ~{int(starting_ib * 0.1):,} sites) in roughly **{months_to_lose_10pct} months**.")
+    elif sc_net > 0 and sc_gross > 0:
+        # What % of growth comes from top contributor
+        top = max(sc_rows, key=lambda r: r["wins"])
+        top_pct = top["wins"] / sc_gross * 100
+        if top_pct > 50:
+            lines.append(f"Growth is heavily concentrated: **{top['team']} / {top['ls']}** "
+                          f"drives {top_pct:.0f}% of all gross adds ({top['wins']:.1f} of {sc_gross:.1f}/month).")
+
     return "\n".join(lines)
 
 
@@ -827,13 +944,10 @@ with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_res
     run_rate_col, scenario_col = st.columns(2)
 
     with run_rate_col:
-        st.markdown(_build_math_breakdown(
-            "Run Rate",
-            baseline_team_params,
-            churn_mean,
-            0.0,
-            latest_ib,
-        ))
+        rr_md, rr_rows, rr_gross, rr_churn_ct, rr_net = _build_math_breakdown(
+            "Run Rate", baseline_team_params, churn_mean, 0.0, latest_ib, defaults,
+        )
+        st.markdown(rr_md)
 
     with scenario_col:
         if st.session_state.scenario_params is not None:
@@ -841,9 +955,24 @@ with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_res
             sn = st.session_state.scenario_name or "Scenario"
             sc = st.session_state.scenario_churn or churn_mean
             sg = st.session_state.scenario_growth or 0.0
-            st.markdown(_build_math_breakdown(sn, sp, sc, sg, latest_ib))
+            sc_md, sc_rows, sc_gross, sc_churn_ct, sc_net = _build_math_breakdown(
+                sn, sp, sc, sg, latest_ib, defaults,
+            )
+            st.markdown(sc_md)
         else:
             st.info("Run a scenario to see its math breakdown here.")
+
+    # Natural language analysis (only when scenario exists)
+    if st.session_state.scenario_params is not None:
+        st.divider()
+        analysis = _generate_analysis(
+            (rr_rows, rr_gross, rr_churn_ct, rr_net),
+            (sc_rows, sc_gross, sc_churn_ct, sc_net),
+            latest_ib, churn_mean,
+            st.session_state.scenario_churn or churn_mean,
+            st.session_state.scenario_growth or 0.0,
+        )
+        st.markdown(analysis)
 
 
 # =============================================================================
