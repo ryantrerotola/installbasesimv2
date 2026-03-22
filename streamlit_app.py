@@ -1323,10 +1323,9 @@ with tab_goalsek:
     with gs_col2:
         gs_month_options = {
             (latest_month + relativedelta(months=m)).strftime("%b %Y"): m
-            for m in [6, 12, 18, 24, 36, 48, 60]
-            if m <= projection_months
+            for m in range(1, projection_months + 1)
         }
-        gs_date_label = st.selectbox("Achieve by", options=list(gs_month_options.keys()), index=1, key="gs_date")
+        gs_date_label = st.selectbox("Achieve by", options=list(gs_month_options.keys()), index=11, key="gs_date")
         gs_target_month = gs_month_options[gs_date_label]
 
     # --- Constraints: lock levers ---
