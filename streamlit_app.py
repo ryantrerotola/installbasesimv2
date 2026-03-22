@@ -844,25 +844,6 @@ with tab_distribution:
         mean_diff = np.mean(sc_sims) - np.mean(rr_sims)
         m3.metric("Mean Difference", f"{mean_diff:+,.0f} sites")
 
-    # --- Target Probability ---
-    st.subheader("Target Analysis")
-    target_ib = st.number_input(
-        "Target Install Base",
-        min_value=0,
-        max_value=50000,
-        value=int(np.median(rr_sims)),
-        step=100,
-        key="target_ib_input",
-        help="What's the probability of reaching this install base?",
-    )
-
-    rr_pct_above = (rr_sims >= target_ib).mean() * 100
-    t1, t2 = st.columns(2)
-    t1.metric(f"P(Run Rate >= {target_ib:,})", f"{rr_pct_above:.1f}%")
-    if has_scenario:
-        sc_pct_above = (sc_sims >= target_ib).mean() * 100
-        t2.metric(f"P({sc_name} >= {target_ib:,})", f"{sc_pct_above:.1f}%")
-
     # --- Box Plot ---
     st.subheader("Distribution Comparison")
     box_fig = go.Figure()
