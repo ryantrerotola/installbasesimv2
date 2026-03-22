@@ -76,16 +76,39 @@ GROUP BY 1, 2, 3
 ORDER BY 2, 3, 1
 """
 
-VELLO_PLACEMENTS_QUERY = """
+VELLO_ATTACH_QUERY = """
+WITH team_opps AS (
+    SELECT DISTINCT
+        DATE_TRUNC('MONTH', ACTUAL_CLOSE_DATE)                                              AS CLOSE_MONTH,
+        TEAM_NAME,
+        CASE WHEN LEADSOURCE = 'IDEXX REFERRAL' THEN 'VDC' ELSE 'Other Leads' END          AS LEAD_SOURCE_GROUP,
+        OPPORTUNITY_ID
+    FROM VSSANALYTICS_DB.SFDC.CDL_SALESFORCE
+    WHERE CURRENT_STAGE = 'WON'
+      AND ACTUAL_CLOSE_DATE IS NOT NULL
+      AND (
+          (TEAM_NAME IN ('SOFTWARE SALES EAST', 'SOFTWARE SALES WEST')
+              AND PRODUCT IN ('ezyVet', 'Neo', 'Vello'))
+          OR (TEAM_NAME = 'ESAM'
+              AND PRODUCT IN ('ezyVet', 'ezyVet Enterprise - GP', 'ezyVet Enterprise - Spec/ER'))
+      )
+),
+vello_flag AS (
+    SELECT DISTINCT OPPORTUNITY_ID
+    FROM VSSANALYTICS_DB.SFDC.CDL_SALESFORCE
+    WHERE PRODUCT = 'Vello'
+      AND CURRENT_STAGE = 'WON'
+)
 SELECT
-    DATE_TRUNC('MONTH', CF_GO_LIVE_DATE)    AS MONTH,
-    COUNT(DISTINCT PROJECT_ID)              AS VELLO_PLACEMENTS
-FROM VSSANALYTICS_DB.GUIDECX.CDL_ONBOARDING
-WHERE VELLO_BOOLEAN = 1
-  AND CF_GO_LIVE_DATE IS NOT NULL
-  AND STATUS NOT IN ('CANCELLED','ON_HOLD')
-GROUP BY 1
-ORDER BY 1
+    t.CLOSE_MONTH,
+    t.TEAM_NAME,
+    t.LEAD_SOURCE_GROUP,
+    COUNT(DISTINCT t.OPPORTUNITY_ID)                                                        AS TOTAL_WON,
+    COUNT(DISTINCT v.OPPORTUNITY_ID)                                                        AS VELLO_WON
+FROM team_opps t
+LEFT JOIN vello_flag v ON t.OPPORTUNITY_ID = v.OPPORTUNITY_ID
+GROUP BY 1, 2, 3
+ORDER BY 2, 3, 1
 """
 
 TIME_TO_BOOKING_QUERY = """
@@ -114,7 +137,11 @@ ORDER BY 2, 3, 1
 TIME_TO_PLACEMENT_QUERY = """
 SELECT
     DATE_TRUNC('MONTH', CF_GO_LIVE_DATE)                                AS MONTH,
-    CF_PRODUCT                                                          AS PRODUCT,
+    CASE
+        WHEN CUSTOMER_TYPE = 'Enterprise' THEN 'ESAM'
+        WHEN ONBOARDING_TYPE IN ('Conversion', 'Fresh') THEN 'SOFTWARE SALES'
+        ELSE 'ISAS'
+    END                                                                 AS TEAM_NAME,
     COUNT(DISTINCT PROJECT_ID)                                          AS PLACEMENTS,
     ROUND(AVG(DATEDIFF('DAY', CREATED_DATE, CF_GO_LIVE_DATE)), 1)      AS AVG_DAYS_TO_PLACEMENT,
     ROUND(MEDIAN(DATEDIFF('DAY', CREATED_DATE, CF_GO_LIVE_DATE)), 1)   AS MEDIAN_DAYS_TO_PLACEMENT
@@ -145,41 +172,6 @@ FROM VSSANALYTICS_DB.OPERATIONS.CDL_ATTRITION
 WHERE PRODUCT = 'Vello'
 GROUP BY 1
 ORDER BY 1
-"""
-
-MQL_CONVERSION_QUERY = """
-SELECT
-    DATE_TRUNC('MONTH', CONTACT_RECENT_MQL_DATE)    AS MONTH,
-    'MQL'                                           AS LEAD_SOURCE,
-    CASE
-        WHEN FLATTENED_PRODUCT IN ('ezyVet', 'Neo') THEN 'ezyVet + Neo'
-        WHEN FLATTENED_PRODUCT = 'Vello' THEN 'Vello'
-    END                                             AS PRODUCT_GROUP,
-    COUNT(DISTINCT HUBSPOT_CONTACT_ID)              AS LEADS,
-    COUNT(DISTINCT OPPORTUNITY_ID)                   AS OPPS_CREATED,
-    ROUND(100.0 * COUNT(DISTINCT OPPORTUNITY_ID)
-        / NULLIF(COUNT(DISTINCT HUBSPOT_CONTACT_ID), 0), 1) AS LEAD_TO_OPP_CONVERSION_PCT
-FROM VSSANALYTICS_DB.STRATPLAN_ANALYSIS.HUBSPOT_TO_SALESFORCE_MAPPING
-WHERE IS_MQL = TRUE
-  AND FLATTENED_PRODUCT IN ('ezyVet', 'Neo', 'Vello')
-  AND CONTACT_RECENT_MQL_DATE IS NOT NULL
-GROUP BY 1, 2, 3
-UNION ALL
-SELECT
-    DATE_TRUNC('MONTH', CREATEDDATE)                AS MONTH,
-    'VDC'                                           AS LEAD_SOURCE,
-    CASE
-        WHEN PRODUCT IN ('ezyVet', 'Neo') THEN 'ezyVet + Neo'
-        WHEN PRODUCT = 'Vello' THEN 'Vello'
-    END                                             AS PRODUCT_GROUP,
-    COUNT(DISTINCT ID)                               AS LEADS,
-    NULL                                             AS OPPS_CREATED,
-    NULL                                             AS LEAD_TO_OPP_CONVERSION_PCT
-FROM VSSANALYTICS_DB.SFDC.SF_VDC_LEADS
-WHERE PRODUCT IN ('ezyVet', 'Neo', 'Vello')
-  AND CREATEDDATE IS NOT NULL
-GROUP BY 1, 2, 3
-ORDER BY 3, 2, 1
 """
 
 
@@ -222,10 +214,15 @@ def load_conversion_rates() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def load_vello_placements() -> pd.DataFrame:
-    df = _run_query(VELLO_PLACEMENTS_QUERY)
-    df["MONTH"] = pd.to_datetime(df["MONTH"])
-    return df
+def load_vello_attach() -> pd.DataFrame:
+    df = _run_query(VELLO_ATTACH_QUERY)
+    df["CLOSE_MONTH"] = pd.to_datetime(df["CLOSE_MONTH"])
+    df["TEAM_NAME"] = df["TEAM_NAME"].replace(TEAM_RENAME)
+    combined = df.groupby(["CLOSE_MONTH", "TEAM_NAME", "LEAD_SOURCE_GROUP"], as_index=False).agg(
+        {"TOTAL_WON": "sum", "VELLO_WON": "sum"}
+    )
+    combined["VELLO_ATTACH_PCT"] = (100.0 * combined["VELLO_WON"] / combined["TOTAL_WON"].replace(0, pd.NA)).round(1)
+    return combined
 
 
 @st.cache_data(ttl=3600)
@@ -259,37 +256,21 @@ def load_churns() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(ttl=3600)
-def load_mql_conversion() -> pd.DataFrame:
-    df = _run_query(MQL_CONVERSION_QUERY)
-    df["MONTH"] = pd.to_datetime(df["MONTH"])
-    return df
-
-
 def load_all_data() -> dict:
     return {
         "sqls_created": load_sqls_created(),
         "conversion_rates": load_conversion_rates(),
-        "vello_placements": load_vello_placements(),
+        "vello_attach": load_vello_attach(),
         "time_to_booking": load_time_to_booking(),
         "time_to_placement": load_time_to_placement(),
         "install_base": load_install_base(),
         "churns": load_churns(),
-        "mql_conversion": load_mql_conversion(),
     }
 
 
 # =============================================================================
 # HISTORICAL DEFAULTS HELPERS
 # =============================================================================
-def _safe_mean(df, product_group, col):
-    subset = df[df["PRODUCT_GROUP"] == product_group] if "PRODUCT_GROUP" in df.columns else df
-    if subset.empty or col not in subset.columns:
-        return 0.0
-    vals = subset[col].dropna()
-    return vals.mean() if not vals.empty else 0.0
-
-
 def _safe_team_mean(df, team, col):
     subset = df[df["TEAM_NAME"] == team] if "TEAM_NAME" in df.columns else df
     if subset.empty or col not in subset.columns:
@@ -347,15 +328,53 @@ def _safe_team_ls_mean(df, team, lead_source, col):
     return vals.mean() if not vals.empty else 0.0
 
 
+def _cohort_conv_std(df, team, lead_source, n_cohorts=6):
+    """Std dev of per-cohort win rates for a team + lead source."""
+    subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if subset.empty:
+        return 0.03
+    recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
+    subset = subset[subset["COHORT_MONTH"].isin(recent)]
+    cohort_rates = subset.groupby("COHORT_MONTH").apply(
+        lambda g: g["WINS"].sum() / max(g["RESOLVED_TOTAL"].sum(), 1)
+    )
+    return max(cohort_rates.std(), 0.01) if len(cohort_rates) > 1 else 0.03
+
+
+def _team_ls_attach(attach_df, team, lead_source, n_months=6):
+    """Compute recent attach rate for a team + lead source from SFDC data."""
+    subset = attach_df[(attach_df["TEAM_NAME"] == team) & (attach_df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if subset.empty:
+        return 100.0
+    recent = subset["CLOSE_MONTH"].drop_duplicates().nlargest(n_months)
+    subset = subset[subset["CLOSE_MONTH"].isin(recent)]
+    total = subset["TOTAL_WON"].sum()
+    vello = subset["VELLO_WON"].sum()
+    return round(100.0 * vello / total, 1) if total > 0 else 100.0
+
+
+def compute_seasonality(ttb_df):
+    """Compute monthly seasonal indices from historical booking volumes."""
+    if ttb_df.empty:
+        return {m: 1.0 for m in range(1, 13)}
+    monthly = ttb_df.groupby("MONTH")["BOOKINGS"].sum().reset_index()
+    monthly["CAL_MONTH"] = monthly["MONTH"].dt.month
+    avg_by_cal = monthly.groupby("CAL_MONTH")["BOOKINGS"].mean()
+    overall_avg = avg_by_cal.mean()
+    if overall_avg == 0:
+        return {m: 1.0 for m in range(1, 13)}
+    indices = (avg_by_cal / overall_avg).to_dict()
+    return {m: round(indices.get(m, 1.0), 3) for m in range(1, 13)}
+
+
 def compute_historical_defaults(data):
     defaults = {}
     recent_months = 6
 
-    mql_df = data["mql_conversion"]
-    mql_recent = mql_df[mql_df["MONTH"] >= mql_df["MONTH"].max() - pd.DateOffset(months=recent_months)]
     sqls_df = data["sqls_created"]
     sqls_recent = sqls_df[sqls_df["MONTH"] >= sqls_df["MONTH"].max() - pd.DateOffset(months=recent_months)]
     conv_df = data["conversion_rates"]
+    attach_df = data["vello_attach"]
     ttb_df = data["time_to_booking"]
     ttb_recent = ttb_df[ttb_df["MONTH"] >= ttb_df["MONTH"].max() - pd.DateOffset(months=recent_months)]
     ttp_df = data["time_to_placement"]
@@ -371,39 +390,30 @@ def compute_historical_defaults(data):
     else:
         monthly_churn_rate = 0.01
 
-    # Vello attach rate approximation
-    placements_df = data["vello_placements"]
-    ss_conv = conv_df[conv_df["TEAM_NAME"] == "SOFTWARE SALES"]
-    ss_recent_cohorts = ss_conv["COHORT_MONTH"].drop_duplicates().nlargest(recent_months)
-    ss_recent = ss_conv[ss_conv["COHORT_MONTH"].isin(ss_recent_cohorts)]
-    ss_monthly_wins = ss_recent["WINS"].sum() / max(len(ss_recent_cohorts), 1)
-    recent_vello = placements_df[placements_df["MONTH"] >= placements_df["MONTH"].max() - pd.DateOffset(months=recent_months)]["VELLO_PLACEMENTS"].mean() if not placements_df.empty else 0
-    vello_attach = min((recent_vello / max(ss_monthly_wins, 1)) * 100, 100) if ss_monthly_wins > 0 else 30.0
-
-    ttp_median = ttp_recent["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not ttp_recent.empty else 90.0
-
-    # MQL mappings per team (informational only)
-    mql_map = {
-        "ISAS": {"product_group": "Vello"},
-        "SOFTWARE SALES": {"product_group": "ezyVet + Neo"},
-        "ESAM": {"product_group": "ezyVet + Neo"},
-    }
-    attach_map = {
-        "SOFTWARE SALES": round(vello_attach, 1),
-        "ESAM": 100.0,
-    }
-
     for team in ALL_TEAMS:
-        pg = mql_map[team]["product_group"]
-        has_attach = team in attach_map
+        # Per-team time to implement from GuideCX
+        team_ttp = ttp_recent[ttp_recent["TEAM_NAME"] == team] if "TEAM_NAME" in ttp_recent.columns else ttp_recent
+        ttp_val = team_ttp["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not team_ttp.empty else 90.0
+
         team_defaults = {
-            "mqls_per_month": round(_safe_mean(mql_recent, pg, "LEADS"), 0),
-            "mql_conversion_rate": round(_safe_mean(mql_recent, pg, "LEAD_TO_OPP_CONVERSION_PCT"), 1),
-            "time_to_implement_days": round(ttp_median if not ttp_recent.empty else (90.0 if team == "ISAS" else 120.0), 0),
+            "time_to_implement_days": round(ttp_val, 0),
             "monthly_churn_rate": round(monthly_churn_rate * 100, 2),
         }
-        if has_attach:
-            team_defaults["vello_attach_rate"] = attach_map[team]
+
+        # Attach rate: ISAS is always 100% (Vello-only), others from SFDC data
+        if team == "ISAS":
+            team_defaults["vello_attach_rate"] = 100.0
+        else:
+            # Team-level blended attach across lead sources
+            team_attach = attach_df[attach_df["TEAM_NAME"] == team]
+            if not team_attach.empty:
+                recent_close = team_attach["CLOSE_MONTH"].drop_duplicates().nlargest(recent_months)
+                ra = team_attach[team_attach["CLOSE_MONTH"].isin(recent_close)]
+                total = ra["TOTAL_WON"].sum()
+                vello = ra["VELLO_WON"].sum()
+                team_defaults["vello_attach_rate"] = round(100.0 * vello / total, 1) if total > 0 else 30.0
+            else:
+                team_defaults["vello_attach_rate"] = 30.0
 
         # Per lead-source defaults
         ls_defaults = {}
@@ -427,28 +437,21 @@ def compute_run_rate_params(data):
     params = {}
     sqls = data["sqls_created"]
     conv = data["conversion_rates"]
+    attach_df = data["vello_attach"]
     ttb = data["time_to_booking"]
     ttp = data["time_to_placement"]
     ttp_recent = ttp[ttp["MONTH"] >= ttp["MONTH"].max() - pd.DateOffset(months=recent_months)]
-    placements = data["vello_placements"]
-    ttp_impl_days = ttp_recent["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not ttp_recent.empty else 90
 
     for team in ALL_TEAMS:
-        # Compute team-level attach rate (shared across lead sources)
-        team_sqls_all = sqls[sqls["TEAM_NAME"] == team]
-        team_recent_all = team_sqls_all[team_sqls_all["MONTH"] >= team_sqls_all["MONTH"].max() - pd.DateOffset(months=recent_months)]
-        monthly_sqls_all = team_recent_all.groupby("MONTH")["SQLS_CREATED"].sum()
-        conv_rate_all = _safe_team_conv(conv, team, n_cohorts=recent_months) / 100.0
+        # Per-team time to implement
+        team_ttp = ttp_recent[ttp_recent["TEAM_NAME"] == team] if "TEAM_NAME" in ttp_recent.columns else ttp_recent
+        ttp_impl_days = team_ttp["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not team_ttp.empty else 90
 
-        if team == "SOFTWARE SALES":
-            plc_recent = placements[placements["MONTH"] >= placements["MONTH"].max() - pd.DateOffset(months=recent_months)] if not placements.empty else placements
-            monthly_plc = plc_recent["VELLO_PLACEMENTS"].mean() if not plc_recent.empty else 0
-            ss_monthly_wins = (conv_rate_all * monthly_sqls_all.mean()) if not monthly_sqls_all.empty else 1
-            attach = min(monthly_plc / max(ss_monthly_wins, 1), 1.0)
-        elif team == "ISAS":
+        # Attach rate from SFDC (ISAS = 100%)
+        if team == "ISAS":
             attach = 1.0
         else:
-            attach = 1.0
+            attach = _team_ls_attach(attach_df, team, "VDC", recent_months) / 100.0  # placeholder, overridden per-ls below
 
         for ls in LEAD_SOURCES:
             ls_sqls = sqls[(sqls["TEAM_NAME"] == team) & (sqls["LEAD_SOURCE_GROUP"] == ls)]
@@ -456,17 +459,21 @@ def compute_run_rate_params(data):
             monthly = ls_recent.groupby("MONTH")["SQLS_CREATED"].sum() if not ls_recent.empty else pd.Series(dtype=float)
 
             cr = _safe_team_ls_conv(conv, team, ls, n_cohorts=recent_months) / 100.0
+            cr_std = _cohort_conv_std(conv, team, ls, n_cohorts=recent_months)
 
             ls_ttb = ttb[(ttb["TEAM_NAME"] == team) & (ttb["LEAD_SOURCE_GROUP"] == ls) & (ttb["MONTH"] >= ttb["MONTH"].max() - pd.DateOffset(months=recent_months))]
+
+            # Per-lead-source attach for non-ISAS teams
+            ls_attach = 1.0 if team == "ISAS" else _team_ls_attach(attach_df, team, ls, recent_months) / 100.0
 
             params[(team, ls)] = {
                 "sqls_mean": monthly.mean() if not monthly.empty else 0,
                 "sqls_std": max(monthly.std(), 1) if not monthly.empty else 1,
                 "conv_rate": cr,
-                "conv_rate_std": max(cr * 0.15, 0.01),
+                "conv_rate_std": cr_std,
                 "time_to_sale_days": ls_ttb["MEDIAN_DAYS_TO_BOOKING"].mean() if not ls_ttb.empty else 60,
                 "time_to_implement_days": ttp_impl_days,
-                "attach_rate": attach,
+                "attach_rate": ls_attach,
             }
 
     # Churn
@@ -491,23 +498,37 @@ def run_monte_carlo(
     churn_rate_std,
     projection_months=PROJECTION_YEARS * 12,
     n_simulations=MONTE_CARLO_SIMULATIONS,
-    lead_growth_rate=0.0,
+    growth_rates=None,
+    seasonality=None,
+    start_calendar_month=1,
 ):
+    """
+    growth_rates: dict keyed same as team_params → monthly growth rate per segment.
+    seasonality: dict {1..12 → multiplier} for calendar month seasonality.
+    start_calendar_month: the calendar month (1-12) of projection month 0.
+    """
     rng = np.random.default_rng(42)
     results = np.zeros((n_simulations, projection_months))
+    if growth_rates is None:
+        growth_rates = {}
+    if seasonality is None:
+        seasonality = {m: 1.0 for m in range(1, 13)}
 
     for sim in range(n_simulations):
         ib = float(starting_install_base)
         pipeline = []
 
         # Pre-fill pipeline with in-flight deals
-        for team_name, tp in team_params.items():
+        for key, tp in team_params.items():
+            gr = growth_rates.get(key, 0.0)
             sale_months = max(tp["time_to_sale_days"] / 30.0, 0.5)
             impl_months = max(tp["time_to_implement_days"] / 30.0, 0.5)
             total_lag = sale_months + impl_months
             for lag_month in range(int(np.ceil(total_lag))):
-                growth_factor = (1 + lead_growth_rate) ** max(0, -lag_month)
-                s = max(rng.normal(tp["sqls_mean"] * growth_factor, tp["sqls_std"]), 0)
+                growth_factor = (1 + gr) ** max(0, -lag_month)
+                cal_month = ((start_calendar_month - 1 - lag_month) % 12) + 1
+                seasonal = seasonality.get(cal_month, 1.0)
+                s = max(rng.normal(tp["sqls_mean"] * growth_factor * seasonal, tp["sqls_std"]), 0)
                 c = np.clip(rng.normal(tp["conv_rate"], tp.get("conv_rate_std", 0.03)), 0, 1)
                 wins = s * c * tp["attach_rate"]
                 go_live = total_lag - lag_month
@@ -515,11 +536,14 @@ def run_monte_carlo(
                     pipeline.append((int(np.round(go_live)), wins))
 
         for month in range(projection_months):
-            growth_factor = (1 + lead_growth_rate) ** month
             monthly_new = 0
+            cal_month = ((start_calendar_month + month) % 12) + 1
 
-            for team_name, tp in team_params.items():
-                s = max(rng.normal(tp["sqls_mean"] * growth_factor, tp["sqls_std"]), 0)
+            for key, tp in team_params.items():
+                gr = growth_rates.get(key, 0.0)
+                growth_factor = (1 + gr) ** month
+                seasonal = seasonality.get(cal_month, 1.0)
+                s = max(rng.normal(tp["sqls_mean"] * growth_factor * seasonal, tp["sqls_std"]), 0)
                 c = np.clip(rng.normal(tp["conv_rate"], tp.get("conv_rate_std", 0.03)), 0, 1)
                 wins = s * c * tp["attach_rate"]
                 sale_m = max(tp["time_to_sale_days"] / 30.0, 0.5)
@@ -548,7 +572,7 @@ def run_monte_carlo(
     }
 
 
-def run_scenario_simulation(starting_install_base, scenario_params, churn_rate_mean, churn_rate_std, lead_growth_rate=0.0, projection_months=PROJECTION_YEARS * 12, n_simulations=MONTE_CARLO_SIMULATIONS):
+def run_scenario_simulation(starting_install_base, scenario_params, churn_rate_mean, churn_rate_std, growth_rates=None, seasonality=None, start_calendar_month=1, projection_months=PROJECTION_YEARS * 12, n_simulations=MONTE_CARLO_SIMULATIONS):
     """scenario_params is keyed by (team, lead_source) tuples."""
     team_params = {}
     for key, sp in scenario_params.items():
@@ -561,7 +585,7 @@ def run_scenario_simulation(starting_install_base, scenario_params, churn_rate_m
             "time_to_implement_days": sp["time_to_implement_days"],
             "attach_rate": sp.get("vello_attach_rate", 100.0) / 100.0,
         }
-    return run_monte_carlo(starting_install_base, team_params, churn_rate_mean, churn_rate_std, projection_months, n_simulations, lead_growth_rate)
+    return run_monte_carlo(starting_install_base, team_params, churn_rate_mean, churn_rate_std, projection_months, n_simulations, growth_rates, seasonality, start_calendar_month)
 
 
 # =============================================================================
@@ -583,25 +607,22 @@ st.metric("Current Vello Install Base", f"{latest_ib:,}", f"As of {latest_month.
 # Compute baselines
 run_rate_params = compute_run_rate_params(data)
 defaults = compute_historical_defaults(data)
+seasonal_indices = compute_seasonality(data["time_to_booking"])
 churn_mean = run_rate_params["churn_rate_mean"]
 churn_std = run_rate_params["churn_rate_std"]
 baseline_team_params = {k: v for k, v in run_rate_params.items() if k not in ("churn_rate_mean", "churn_rate_std") and isinstance(k, tuple)}
+start_cal_month = latest_month.month
 
 projection_months = PROJECTION_YEARS * 12
-baseline_result = run_monte_carlo(latest_ib, baseline_team_params, churn_mean, churn_std, projection_months)
+baseline_result = run_monte_carlo(latest_ib, baseline_team_params, churn_mean, churn_std, projection_months, seasonality=seasonal_indices, start_calendar_month=start_cal_month)
 projection_dates = [latest_month + relativedelta(months=i) for i in range(1, projection_months + 1)]
 
 # Session state for scenario
-if "scenario_result" not in st.session_state:
-    st.session_state.scenario_result = None
-if "scenario_name" not in st.session_state:
+for _key in ("scenario_result", "scenario_name", "scenario_params", "scenario_churn", "scenario_growth_rates"):
+    if _key not in st.session_state:
+        st.session_state[_key] = None
+if st.session_state.scenario_name is None:
     st.session_state.scenario_name = ""
-if "scenario_params" not in st.session_state:
-    st.session_state.scenario_params = None
-if "scenario_churn" not in st.session_state:
-    st.session_state.scenario_churn = None
-if "scenario_growth" not in st.session_state:
-    st.session_state.scenario_growth = None
 
 
 @st.dialog("Scenario Planner", width="large")
@@ -610,33 +631,24 @@ def scenario_planner_modal():
     scenario_name = st.text_input("Scenario Name", value="My Scenario", key="modal_scenario_name")
 
     st.subheader("Global Settings")
-    col_g1, col_g2 = st.columns(2)
-    with col_g1:
-        lead_growth = st.slider("Monthly Lead/SQL Growth Rate (%)", min_value=-5.0, max_value=10.0, value=0.0, step=0.1, key="global_lead_growth", help="Compound monthly growth applied to SQLs across all teams")
-    with col_g2:
-        churn_override = st.slider("Monthly Churn Rate (%)", min_value=0.0, max_value=5.0, value=round(churn_mean * 100, 2), step=0.05, key="global_churn")
+    churn_multiplier = st.slider("Churn Multiplier", min_value=0.0, max_value=3.0, value=1.0, step=0.1, key="global_churn_mult", help=f"1.0x = current rate ({churn_mean*100:.2f}%/mo). 0x = no churn. 3x = triple churn.")
 
     team_tabs = st.tabs(ALL_TEAMS)
     scenario_params = {}
+    growth_rates = {}
 
     for tab, team in zip(team_tabs, ALL_TEAMS):
         with tab:
             d = defaults.get(team, {})
             ls_defaults = d.get("lead_sources", {})
-            has_attach = team in ("SOFTWARE SALES", "ESAM")
             st.markdown(f"**{team}** — adjust the levers below")
 
             # Team-level shared inputs
-            shared_c1, shared_c2, shared_c3 = st.columns(3)
+            shared_c1, shared_c2 = st.columns(2)
             with shared_c1:
-                mqls = st.number_input("MQLs / Month", min_value=0, max_value=5000, value=int(d.get("mqls_per_month", 100)), step=10, key=f"{team}_mqls")
-                mql_conv = st.slider("MQL → SQL Conv (%)", min_value=0.0, max_value=100.0, value=float(d.get("mql_conversion_rate", 10.0)), step=0.5, key=f"{team}_mql_conv", help="Informational — SQLs are set independently since MQL-to-SQL mapping isn't 1:1")
-            with shared_c2:
                 tti = st.number_input("Time to Implement (days)", min_value=1, max_value=2000, value=int(d.get("time_to_implement_days", 90)), step=5, key=f"{team}_tti")
-            with shared_c3:
-                attach = 100.0
-                if has_attach:
-                    attach = st.slider("Vello Attach Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("vello_attach_rate", 30.0)), step=1.0, key=f"{team}_attach", help="% of converted deals that include Vello")
+            with shared_c2:
+                attach = st.slider("Vello Attach Rate (%)", min_value=0.0, max_value=100.0, value=float(d.get("vello_attach_rate", 100.0)), step=1.0, key=f"{team}_attach", help="% of won deals that include Vello")
 
             st.divider()
 
@@ -653,10 +665,11 @@ def scenario_planner_modal():
                     sqls = st.number_input("SQLs / Month", min_value=0, max_value=2000, value=int(ls_d.get("sqls_per_month", 0)), step=5, key=f"{team}_{ls}_sqls")
                     sql_conv = st.slider("SQL Win Rate (%)", min_value=0.0, max_value=100.0, value=float(ls_d.get("sql_conversion_rate", 10.0)), step=0.5, key=f"{team}_{ls}_sql_conv")
                     tts = st.number_input("Time to Sale (days)", min_value=1, max_value=730, value=max(int(ls_d.get("time_to_sale_days", 60)), 1), step=5, key=f"{team}_{ls}_tts")
+                    ls_growth = st.slider("SQL Growth (%/mo)", min_value=-5.0, max_value=10.0, value=0.0, step=0.1, key=f"{team}_{ls}_growth", help="Compound monthly growth rate for this segment's SQLs")
 
                     wins = sqls * (sql_conv / 100.0) * (attach / 100.0)
                     total_monthly_wins += wins
-                    ls_details.append(f"{ls}: {sqls} SQLs × {sql_conv:.1f}%")
+                    ls_details.append(f"{ls}: {sqls} SQLs x {sql_conv:.1f}%")
 
                     scenario_params[(team, ls)] = {
                         "sqls_per_month": sqls,
@@ -665,23 +678,25 @@ def scenario_planner_modal():
                         "time_to_implement_days": tti,
                         "vello_attach_rate": attach,
                     }
+                    growth_rates[(team, ls)] = ls_growth / 100.0
 
             st.info(
                 f"**Projected monthly Vello placements from {team}:** "
                 + " + ".join(ls_details)
-                + (f" × {attach:.1f}% attach" if has_attach else "")
+                + (f" x {attach:.1f}% attach" if attach < 100 else "")
                 + f" = **{total_monthly_wins:.1f}** placements/month"
             )
 
     st.divider()
     if st.button("Run Simulation", type="primary", use_container_width=True):
+        effective_churn = churn_mean * churn_multiplier
         with st.spinner(f"Running {MONTE_CARLO_SIMULATIONS:,} simulations..."):
-            result = run_scenario_simulation(latest_ib, scenario_params, churn_override / 100.0, churn_std, lead_growth / 100.0, projection_months)
+            result = run_scenario_simulation(latest_ib, scenario_params, effective_churn, churn_std * churn_multiplier, growth_rates, seasonal_indices, start_cal_month, projection_months)
         st.session_state.scenario_result = result
         st.session_state.scenario_name = scenario_name
         st.session_state.scenario_params = scenario_params
-        st.session_state.scenario_churn = churn_override / 100.0
-        st.session_state.scenario_growth = lead_growth / 100.0
+        st.session_state.scenario_churn = effective_churn
+        st.session_state.scenario_growth_rates = growth_rates
         st.success("Simulation complete! Close this dialog to see results on the chart.")
         st.rerun()
 
@@ -766,20 +781,18 @@ def _extract_row(p):
     return sqls, cr, attach, tts, tti
 
 
-def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib, team_defaults):
-    """Build a markdown string showing the full funnel math behind a projection."""
+def _build_math_breakdown(label, params, churn_rate, growth_rates, starting_ib):
+    """Build a markdown string showing the funnel math behind a projection."""
     lines = []
     lines.append(f"### {label}")
     lines.append("")
 
-    # Full funnel table
-    lines.append("| Team | Lead Source | MQLs/mo | MQL Conv | SQLs/mo | Win Rate | Attach | Wins/mo |")
-    lines.append("|------|------------|---------|----------|---------|----------|--------|---------|")
+    lines.append("| Team | Lead Source | SQLs/mo | Win Rate | Attach | Growth | Wins/mo |")
+    lines.append("|------|------------|---------|----------|--------|--------|---------|")
 
     team_subtotals = {}
     total_gross = 0.0
-    rows_data = []  # for analysis
-    prev_team = None
+    rows_data = []
 
     for key, p in sorted(params.items(), key=lambda x: x[0]):
         if not isinstance(key, tuple):
@@ -789,25 +802,16 @@ def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib, t
         wins = sqls * cr * attach
         total_gross += wins
         team_subtotals[team] = team_subtotals.get(team, 0) + wins
-        rows_data.append({"team": team, "ls": ls, "sqls": sqls, "cr": cr, "attach": attach, "wins": wins, "tts": tts, "tti": tti})
+        gr = growth_rates.get(key, 0.0) if growth_rates else 0.0
+        rows_data.append({"team": team, "ls": ls, "sqls": sqls, "cr": cr, "attach": attach, "wins": wins, "tts": tts, "tti": tti, "growth": gr})
 
-        # Show MQLs only on the first row per team
-        td = team_defaults.get(team, {})
-        if team != prev_team:
-            mql_str = f"{int(td.get('mqls_per_month', 0)):,}"
-            mql_conv_str = f"{td.get('mql_conversion_rate', 0):.1f}%"
-        else:
-            mql_str = ""
-            mql_conv_str = ""
-        prev_team = team
-
-        lines.append(f"| {team} | {ls} | {mql_str} | {mql_conv_str} | {sqls:.1f} | {cr*100:.1f}% | {attach*100:.0f}% | **{wins:.1f}** |")
+        gr_str = f"{gr*100:+.1f}%" if gr != 0 else "—"
+        lines.append(f"| {team} | {ls} | {sqls:.1f} | {cr*100:.1f}% | {attach*100:.0f}% | {gr_str} | **{wins:.1f}** |")
 
     lines.append("")
     lines.append("**Team subtotals:** " + " | ".join(f"{t} = {w:.1f}" for t, w in team_subtotals.items()))
     lines.append("")
 
-    # Net math
     monthly_churn_count = starting_ib * churn_rate
     net_monthly = total_gross - monthly_churn_count
     lines.append(f"**Gross adds/month:** {total_gross:.1f} placements")
@@ -815,16 +819,13 @@ def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib, t
     lines.append(f"**Monthly churn:** {starting_ib:,} x {churn_rate*100:.2f}% = {monthly_churn_count:.1f} churns")
     lines.append(f"")
     lines.append(f"**Net monthly change:** {total_gross:.1f} - {monthly_churn_count:.1f} = **{net_monthly:+.1f}** sites/month")
-    if growth_rate != 0:
-        lines.append(f"")
-        lines.append(f"**SQL growth rate:** {growth_rate*100:.1f}%/month (compounds over time)")
     lines.append(f"")
     lines.append(f"**Annualized net adds (year 1, approx):** ~{net_monthly * 12:,.0f} sites")
 
     return "\n".join(lines), rows_data, total_gross, monthly_churn_count, net_monthly
 
 
-def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, scenario_churn, scenario_growth):
+def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, scenario_churn):
     """Generate natural language analysis comparing run rate to scenario."""
     rr_rows, rr_gross, rr_churn_ct, rr_net = run_rate_data
     sc_rows, sc_gross, sc_churn_ct, sc_net = scenario_data
@@ -848,7 +849,6 @@ def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, sc
     lines.append("")
 
     # 2. Break down the biggest movers
-    # Build a dict of (team, ls) -> delta_wins
     rr_map = {(r["team"], r["ls"]): r for r in rr_rows}
     sc_map = {(r["team"], r["ls"]): r for r in sc_rows}
     all_keys = set(rr_map.keys()) | set(sc_map.keys())
@@ -859,7 +859,6 @@ def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, sc
         sc_w = sc_map.get(k, {}).get("wins", 0)
         delta_w = sc_w - rr_w
         if abs(delta_w) > 0.05:
-            # Explain why
             rr_r = rr_map.get(k, {})
             sc_r = sc_map.get(k, {})
             reasons = []
@@ -867,15 +866,18 @@ def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, sc
             sc_sqls = sc_r.get("sqls", 0)
             if sc_sqls != rr_sqls and rr_sqls > 0:
                 pct = (sc_sqls - rr_sqls) / rr_sqls * 100
-                reasons.append(f"SQLs {'up' if pct > 0 else 'down'} {abs(pct):.0f}% ({rr_sqls:.0f} → {sc_sqls:.0f})")
+                reasons.append(f"SQLs {'up' if pct > 0 else 'down'} {abs(pct):.0f}% ({rr_sqls:.0f} -> {sc_sqls:.0f})")
             rr_cr = rr_r.get("cr", 0)
             sc_cr = sc_r.get("cr", 0)
             if abs(sc_cr - rr_cr) > 0.005:
-                reasons.append(f"win rate {'up' if sc_cr > rr_cr else 'down'} ({rr_cr*100:.1f}% → {sc_cr*100:.1f}%)")
+                reasons.append(f"win rate {'up' if sc_cr > rr_cr else 'down'} ({rr_cr*100:.1f}% -> {sc_cr*100:.1f}%)")
             rr_att = rr_r.get("attach", 1)
             sc_att = sc_r.get("attach", 1)
             if abs(sc_att - rr_att) > 0.005:
-                reasons.append(f"attach rate {'up' if sc_att > rr_att else 'down'} ({rr_att*100:.0f}% → {sc_att*100:.0f}%)")
+                reasons.append(f"attach rate {'up' if sc_att > rr_att else 'down'} ({rr_att*100:.0f}% -> {sc_att*100:.0f}%)")
+            sc_gr = sc_r.get("growth", 0)
+            if sc_gr != 0:
+                reasons.append(f"SQL growth {sc_gr*100:+.1f}%/mo")
             deltas.append((k, delta_w, reasons))
 
     deltas.sort(key=lambda x: abs(x[1]), reverse=True)
@@ -886,32 +888,23 @@ def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, sc
         for (team, ls), delta_w, reasons in deltas:
             direction = "more" if delta_w > 0 else "fewer"
             reason_str = "; ".join(reasons) if reasons else "parameter changes"
-            lines.append(f"- **{team} / {ls}:** {abs(delta_w):+.1f} {direction} wins/month — {reason_str}")
+            lines.append(f"- **{team} / {ls}:** {abs(delta_w):.1f} {direction} wins/month — {reason_str}")
         lines.append("")
 
     # 3. Churn comparison
     if abs(scenario_churn - churn_mean) > 0.0001:
         churn_delta = (scenario_churn - churn_mean) * starting_ib
-        direction = "higher" if scenario_churn > churn_mean else "lower"
-        lines.append(f"**Churn** is set {direction} than historical ({scenario_churn*100:.2f}% vs {churn_mean*100:.2f}%), "
+        mult = scenario_churn / churn_mean if churn_mean > 0 else 1.0
+        lines.append(f"**Churn** is {mult:.1f}x the historical rate ({scenario_churn*100:.2f}% vs {churn_mean*100:.2f}%), "
                       f"{'adding' if churn_delta > 0 else 'saving'} ~{abs(churn_delta):.0f} sites/month of churn.")
         lines.append("")
 
-    # 4. Growth rate effect
-    if scenario_growth != 0:
-        yr1_compound = (1 + scenario_growth) ** 12
-        lines.append(f"**SQL growth** of {scenario_growth*100:.1f}%/month means SQLs will be "
-                      f"{yr1_compound:.1f}x current levels in 12 months, significantly "
-                      f"{'accelerating' if scenario_growth > 0 else 'decelerating'} later years.")
-        lines.append("")
-
-    # 5. Sustainability check
+    # 4. Sustainability check
     if sc_net < 0:
         months_to_lose_10pct = int(0.1 * starting_ib / abs(sc_net)) if sc_net != 0 else 0
         lines.append(f"At this pace, the install base would shrink ~10% "
                       f"(lose ~{int(starting_ib * 0.1):,} sites) in roughly **{months_to_lose_10pct} months**.")
     elif sc_net > 0 and sc_gross > 0:
-        # What % of growth comes from top contributor
         top = max(sc_rows, key=lambda r: r["wins"])
         top_pct = top["wins"] / sc_gross * 100
         if top_pct > 50:
@@ -926,7 +919,7 @@ with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_res
 
     with run_rate_col:
         rr_md, rr_rows, rr_gross, rr_churn_ct, rr_net = _build_math_breakdown(
-            "Run Rate", baseline_team_params, churn_mean, 0.0, latest_ib, defaults,
+            "Run Rate", baseline_team_params, churn_mean, None, latest_ib,
         )
         st.markdown(rr_md)
 
@@ -935,9 +928,9 @@ with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_res
             sp = st.session_state.scenario_params
             sn = st.session_state.scenario_name or "Scenario"
             sc = st.session_state.scenario_churn or churn_mean
-            sg = st.session_state.scenario_growth or 0.0
+            sg = st.session_state.scenario_growth_rates or {}
             sc_md, sc_rows, sc_gross, sc_churn_ct, sc_net = _build_math_breakdown(
-                sn, sp, sc, sg, latest_ib, defaults,
+                sn, sp, sc, sg, latest_ib,
             )
             st.markdown(sc_md)
         else:
@@ -951,7 +944,6 @@ with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_res
             (sc_rows, sc_gross, sc_churn_ct, sc_net),
             latest_ib, churn_mean,
             st.session_state.scenario_churn or churn_mean,
-            st.session_state.scenario_growth or 0.0,
         )
         st.markdown(analysis)
 
@@ -960,7 +952,7 @@ with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_res
 # HISTORICAL DATA EXPLORER
 # =============================================================================
 with st.expander("Historical Data Explorer"):
-    t1, t2, t3, t4, t5 = st.tabs(["Install Base", "Churns", "SQLs Created", "Conversion Rates", "MQL Conversion"])
+    t1, t2, t3, t4, t5 = st.tabs(["Install Base", "Churns", "SQLs Created", "Conversion Rates", "Vello Attach"])
     with t1:
         st.dataframe(ib_df.sort_values("REPORTING_MONTH", ascending=False), use_container_width=True, hide_index=True)
     with t2:
@@ -970,4 +962,4 @@ with st.expander("Historical Data Explorer"):
     with t4:
         st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "COHORT_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
     with t5:
-        st.dataframe(data["mql_conversion"].sort_values("MONTH", ascending=False), use_container_width=True, hide_index=True)
+        st.dataframe(data["vello_attach"].sort_values(["TEAM_NAME", "CLOSE_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
