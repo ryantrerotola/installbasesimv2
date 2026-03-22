@@ -39,12 +39,7 @@ ORDER BY 2, 3, 1
 """
 
 CONVERSION_RATES_QUERY = """
-WITH months AS (
-    SELECT DATEADD('MONTH', SEQ4(), '2020-01-01')::DATE AS REPORTING_MONTH
-    FROM TABLE(GENERATOR(ROWCOUNT => 200))
-    WHERE DATEADD('MONTH', SEQ4(), '2020-01-01') <= DATE_TRUNC('MONTH', CURRENT_DATE())
-),
-opps AS (
+WITH opps AS (
     SELECT
         TEAM_NAME,
         CASE WHEN LEADSOURCE = 'IDEXX REFERRAL' THEN 'VDC' ELSE 'Other Leads' END AS LEAD_SOURCE_GROUP,
@@ -53,48 +48,31 @@ opps AS (
         OPPORTUNITY_CREATED_DATE,
         ACTUAL_CLOSE_DATE
     FROM VSSANALYTICS_DB.SFDC.CDL_SALESFORCE
-    WHERE (
+    WHERE OPPORTUNITY_CREATED_DATE IS NOT NULL
+      AND (
           (TEAM_NAME = 'ISAS' AND PRODUCT = 'Vello')
           OR (TEAM_NAME IN ('SOFTWARE SALES EAST', 'SOFTWARE SALES WEST')
               AND PRODUCT IN ('ezyVet', 'Neo', 'Vello'))
           OR (TEAM_NAME = 'ESAM'
               AND PRODUCT IN ('ezyVet', 'ezyVet Enterprise - GP', 'ezyVet Enterprise - Spec/ER'))
       )
-),
-monthly_conv AS (
-    SELECT
-        m.REPORTING_MONTH,
-        o.TEAM_NAME,
-        o.LEAD_SOURCE_GROUP,
-        COUNT(DISTINCT CASE WHEN o.CURRENT_STAGE = 'WON' THEN o.OPPORTUNITY_ID END)        AS WINS,
-        COUNT(DISTINCT CASE WHEN o.CURRENT_STAGE = 'CANCELLED' THEN o.OPPORTUNITY_ID END)  AS CANCELS,
-        COUNT(DISTINCT CASE WHEN o.CURRENT_STAGE = 'LOST' THEN o.OPPORTUNITY_ID END)       AS LOST,
-        COUNT(DISTINCT CASE WHEN o.CURRENT_STAGE NOT IN ('WON','CANCELLED','LOST','CAG PARENT CLOSED')
-            AND DATEDIFF('DAY', o.OPPORTUNITY_CREATED_DATE, LAST_DAY(m.REPORTING_MONTH)) >= 180
-            THEN o.OPPORTUNITY_ID END)                                                     AS OPEN_180_PLUS,
-        COUNT(DISTINCT CASE WHEN o.CURRENT_STAGE NOT IN ('WON','CANCELLED','LOST','CAG PARENT CLOSED')
-            AND DATEDIFF('DAY', o.OPPORTUNITY_CREATED_DATE, LAST_DAY(m.REPORTING_MONTH)) < 180
-            THEN o.OPPORTUNITY_ID END)                                                     AS OPEN_ACTIVE
-    FROM months m
-    JOIN opps o
-      ON (o.OPPORTUNITY_CREATED_DATE >= DATEADD('MONTH', -18, m.REPORTING_MONTH)
-          AND o.OPPORTUNITY_CREATED_DATE < DATEADD('MONTH', 1, m.REPORTING_MONTH))
-      OR (o.ACTUAL_CLOSE_DATE >= DATEADD('MONTH', -18, m.REPORTING_MONTH)
-          AND o.ACTUAL_CLOSE_DATE < DATEADD('MONTH', 1, m.REPORTING_MONTH))
-    GROUP BY 1, 2, 3
 )
 SELECT
-    REPORTING_MONTH,
+    DATE_TRUNC('MONTH', OPPORTUNITY_CREATED_DATE)                                           AS COHORT_MONTH,
     TEAM_NAME,
     LEAD_SOURCE_GROUP,
-    WINS,
-    CANCELS,
-    LOST,
-    OPEN_180_PLUS,
-    OPEN_ACTIVE,
-    WINS + CANCELS + LOST + OPEN_180_PLUS                                                  AS RESOLVED_TOTAL,
-    ROUND(100.0 * WINS / NULLIF(WINS + CANCELS + LOST + OPEN_180_PLUS, 0), 1)             AS CONVERSION_RATE_PCT
-FROM monthly_conv
+    COUNT(DISTINCT OPPORTUNITY_ID)                                                          AS TOTAL_OPPS,
+    COUNT(DISTINCT CASE WHEN CURRENT_STAGE = 'WON' THEN OPPORTUNITY_ID END)                AS WINS,
+    COUNT(DISTINCT CASE WHEN CURRENT_STAGE IN ('CANCELLED', 'LOST') THEN OPPORTUNITY_ID END) AS CLOSED_LOST,
+    COUNT(DISTINCT CASE WHEN CURRENT_STAGE NOT IN ('WON', 'CANCELLED', 'LOST', 'CAG PARENT CLOSED')
+        AND DATEDIFF('DAY', OPPORTUNITY_CREATED_DATE, CURRENT_DATE()) >= 180
+        THEN OPPORTUNITY_ID END)                                                            AS OPEN_STALE,
+    COUNT(DISTINCT CASE WHEN CURRENT_STAGE NOT IN ('WON', 'CANCELLED', 'LOST', 'CAG PARENT CLOSED')
+        AND DATEDIFF('DAY', OPPORTUNITY_CREATED_DATE, CURRENT_DATE()) < 180
+        THEN OPPORTUNITY_ID END)                                                            AS OPEN_ACTIVE
+FROM opps
+WHERE DATEDIFF('MONTH', OPPORTUNITY_CREATED_DATE, CURRENT_DATE()) >= 6
+GROUP BY 1, 2, 3
 ORDER BY 2, 3, 1
 """
 
@@ -233,12 +211,12 @@ def load_sqls_created() -> pd.DataFrame:
 @st.cache_data(ttl=3600)
 def load_conversion_rates() -> pd.DataFrame:
     df = _run_query(CONVERSION_RATES_QUERY)
-    df["REPORTING_MONTH"] = pd.to_datetime(df["REPORTING_MONTH"])
+    df["COHORT_MONTH"] = pd.to_datetime(df["COHORT_MONTH"])
     df["TEAM_NAME"] = df["TEAM_NAME"].replace(TEAM_RENAME)
-    combined = df.groupby(["REPORTING_MONTH", "TEAM_NAME", "LEAD_SOURCE_GROUP"], as_index=False).agg(
-        {"WINS": "sum", "CANCELS": "sum", "LOST": "sum", "OPEN_180_PLUS": "sum", "OPEN_ACTIVE": "sum"}
+    combined = df.groupby(["COHORT_MONTH", "TEAM_NAME", "LEAD_SOURCE_GROUP"], as_index=False).agg(
+        {"TOTAL_OPPS": "sum", "WINS": "sum", "CLOSED_LOST": "sum", "OPEN_STALE": "sum", "OPEN_ACTIVE": "sum"}
     )
-    combined["RESOLVED_TOTAL"] = combined["WINS"] + combined["CANCELS"] + combined["LOST"] + combined["OPEN_180_PLUS"]
+    combined["RESOLVED_TOTAL"] = combined["WINS"] + combined["CLOSED_LOST"] + combined["OPEN_STALE"]
     combined["CONVERSION_RATE_PCT"] = (100.0 * combined["WINS"] / combined["RESOLVED_TOTAL"].replace(0, pd.NA)).round(1)
     return combined
 
@@ -329,10 +307,13 @@ def _safe_team_monthly_total(df, team, month_col, value_col):
     return monthly.mean() if not monthly.empty else 0.0
 
 
-def _safe_team_conv(df, team):
+def _safe_team_conv(df, team, n_cohorts=6):
+    """Volume-weighted win rate across the most recent N cohort months for a team."""
     subset = df[df["TEAM_NAME"] == team]
     if subset.empty:
         return 0.0
+    recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
+    subset = subset[subset["COHORT_MONTH"].isin(recent)]
     total_resolved = subset["RESOLVED_TOTAL"].sum()
     return (100.0 * subset["WINS"].sum() / total_resolved) if total_resolved > 0 else 0.0
 
@@ -346,11 +327,13 @@ def _safe_team_ls_monthly_total(df, team, lead_source, month_col, value_col):
     return monthly.mean() if not monthly.empty else 0.0
 
 
-def _safe_team_ls_conv(df, team, lead_source):
-    """Conversion rate for a specific team + lead source."""
+def _safe_team_ls_conv(df, team, lead_source, n_cohorts=6):
+    """Volume-weighted win rate across the most recent N cohort months for a team + lead source."""
     subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
     if subset.empty:
         return 0.0
+    recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
+    subset = subset[subset["COHORT_MONTH"].isin(recent)]
     total_resolved = subset["RESOLVED_TOTAL"].sum()
     return (100.0 * subset["WINS"].sum() / total_resolved) if total_resolved > 0 else 0.0
 
@@ -373,7 +356,6 @@ def compute_historical_defaults(data):
     sqls_df = data["sqls_created"]
     sqls_recent = sqls_df[sqls_df["MONTH"] >= sqls_df["MONTH"].max() - pd.DateOffset(months=recent_months)]
     conv_df = data["conversion_rates"]
-    conv_latest = conv_df[conv_df["REPORTING_MONTH"] == conv_df["REPORTING_MONTH"].max()]
     ttb_df = data["time_to_booking"]
     ttb_recent = ttb_df[ttb_df["MONTH"] >= ttb_df["MONTH"].max() - pd.DateOffset(months=recent_months)]
     ttp_df = data["time_to_placement"]
@@ -391,10 +373,12 @@ def compute_historical_defaults(data):
 
     # Vello attach rate approximation
     placements_df = data["vello_placements"]
-    ss_wins = conv_latest[conv_latest["TEAM_NAME"] == "SOFTWARE SALES"]["WINS"].sum()
+    ss_conv = conv_df[conv_df["TEAM_NAME"] == "SOFTWARE SALES"]
+    ss_recent_cohorts = ss_conv["COHORT_MONTH"].drop_duplicates().nlargest(recent_months)
+    ss_recent = ss_conv[ss_conv["COHORT_MONTH"].isin(ss_recent_cohorts)]
+    ss_monthly_wins = ss_recent["WINS"].sum() / max(len(ss_recent_cohorts), 1)
     recent_vello = placements_df[placements_df["MONTH"] >= placements_df["MONTH"].max() - pd.DateOffset(months=recent_months)]["VELLO_PLACEMENTS"].mean() if not placements_df.empty else 0
-    ss_monthly_wins = ss_wins / 18 if ss_wins > 0 else 1
-    vello_attach = min((recent_vello / ss_monthly_wins) * 100, 100) if ss_monthly_wins > 0 else 30.0
+    vello_attach = min((recent_vello / max(ss_monthly_wins, 1)) * 100, 100) if ss_monthly_wins > 0 else 30.0
 
     ttp_median = ttp_recent["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not ttp_recent.empty else 90.0
 
@@ -426,7 +410,7 @@ def compute_historical_defaults(data):
         for ls in LEAD_SOURCES:
             ls_defaults[ls] = {
                 "sqls_per_month": round(_safe_team_ls_monthly_total(sqls_recent, team, ls, "MONTH", "SQLS_CREATED"), 0),
-                "sql_conversion_rate": round(_safe_team_ls_conv(conv_latest, team, ls), 1),
+                "sql_conversion_rate": round(_safe_team_ls_conv(conv_df, team, ls), 1),
                 "time_to_sale_days": round(_safe_team_ls_mean(ttb_recent, team, ls, "MEDIAN_DAYS_TO_BOOKING"), 0) or round(_safe_team_mean(ttb_recent, team, "MEDIAN_DAYS_TO_BOOKING"), 0),
             }
         team_defaults["lead_sources"] = ls_defaults
@@ -443,7 +427,6 @@ def compute_run_rate_params(data):
     params = {}
     sqls = data["sqls_created"]
     conv = data["conversion_rates"]
-    latest_month = conv["REPORTING_MONTH"].max()
     ttb = data["time_to_booking"]
     ttp = data["time_to_placement"]
     ttp_recent = ttp[ttp["MONTH"] >= ttp["MONTH"].max() - pd.DateOffset(months=recent_months)]
@@ -455,8 +438,7 @@ def compute_run_rate_params(data):
         team_sqls_all = sqls[sqls["TEAM_NAME"] == team]
         team_recent_all = team_sqls_all[team_sqls_all["MONTH"] >= team_sqls_all["MONTH"].max() - pd.DateOffset(months=recent_months)]
         monthly_sqls_all = team_recent_all.groupby("MONTH")["SQLS_CREATED"].sum()
-        team_conv_all = conv[(conv["TEAM_NAME"] == team) & (conv["REPORTING_MONTH"] == latest_month)]
-        conv_rate_all = team_conv_all["WINS"].sum() / max(team_conv_all["RESOLVED_TOTAL"].sum(), 1)
+        conv_rate_all = _safe_team_conv(conv, team, n_cohorts=recent_months) / 100.0
 
         if team == "SOFTWARE SALES":
             plc_recent = placements[placements["MONTH"] >= placements["MONTH"].max() - pd.DateOffset(months=recent_months)] if not placements.empty else placements
@@ -473,8 +455,7 @@ def compute_run_rate_params(data):
             ls_recent = ls_sqls[ls_sqls["MONTH"] >= ls_sqls["MONTH"].max() - pd.DateOffset(months=recent_months)] if not ls_sqls.empty else ls_sqls
             monthly = ls_recent.groupby("MONTH")["SQLS_CREATED"].sum() if not ls_recent.empty else pd.Series(dtype=float)
 
-            ls_conv = conv[(conv["TEAM_NAME"] == team) & (conv["LEAD_SOURCE_GROUP"] == ls) & (conv["REPORTING_MONTH"] == latest_month)]
-            cr = ls_conv["WINS"].sum() / max(ls_conv["RESOLVED_TOTAL"].sum(), 1)
+            cr = _safe_team_ls_conv(conv, team, ls, n_cohorts=recent_months) / 100.0
 
             ls_ttb = ttb[(ttb["TEAM_NAME"] == team) & (ttb["LEAD_SOURCE_GROUP"] == ls) & (ttb["MONTH"] >= ttb["MONTH"].max() - pd.DateOffset(months=recent_months))]
 
@@ -482,7 +463,7 @@ def compute_run_rate_params(data):
                 "sqls_mean": monthly.mean() if not monthly.empty else 0,
                 "sqls_std": max(monthly.std(), 1) if not monthly.empty else 1,
                 "conv_rate": cr,
-                "conv_rate_std": 0.03,
+                "conv_rate_std": max(cr * 0.15, 0.01),
                 "time_to_sale_days": ls_ttb["MEDIAN_DAYS_TO_BOOKING"].mean() if not ls_ttb.empty else 60,
                 "time_to_implement_days": ttp_impl_days,
                 "attach_rate": attach,
@@ -987,6 +968,6 @@ with st.expander("Historical Data Explorer"):
     with t3:
         st.dataframe(data["sqls_created"].sort_values(["TEAM_NAME", "MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
     with t4:
-        st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "REPORTING_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
+        st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "COHORT_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
     with t5:
         st.dataframe(data["mql_conversion"].sort_values("MONTH", ascending=False), use_container_width=True, hide_index=True)
