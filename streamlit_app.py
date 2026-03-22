@@ -569,6 +569,7 @@ def run_monte_carlo(
         "p5": np.percentile(results, alpha * 100, axis=0),
         "p95": np.percentile(results, (1 - alpha) * 100, axis=0),
         "mean": np.mean(results, axis=0),
+        "raw": results,
     }
 
 
@@ -704,65 +705,177 @@ def scenario_planner_modal():
 if st.button("Create Scenario", type="primary"):
     scenario_planner_modal()
 
+tab_projections, tab_distribution = st.tabs(["Projections", "Monte Carlo Distribution"])
+
 # =============================================================================
-# CHART
+# TAB 1 — PROJECTIONS
 # =============================================================================
-fig = go.Figure()
+with tab_projections:
+    # CHART
+    fig = go.Figure()
 
-fig.add_trace(go.Scatter(x=ib_df["REPORTING_MONTH"], y=ib_df["VELLO_INSTALL_BASE"], mode="lines+markers", name="Actuals", line=dict(color="#1f77b4", width=3), marker=dict(size=4)))
+    fig.add_trace(go.Scatter(x=ib_df["REPORTING_MONTH"], y=ib_df["VELLO_INSTALL_BASE"], mode="lines+markers", name="Actuals", line=dict(color="#1f77b4", width=3), marker=dict(size=4)))
 
-fig.add_trace(go.Scatter(x=projection_dates, y=baseline_result["median"], mode="lines", name="Run Rate (Median)", line=dict(color="#ff7f0e", width=2, dash="dash")))
+    fig.add_trace(go.Scatter(x=projection_dates, y=baseline_result["median"], mode="lines", name="Run Rate (Median)", line=dict(color="#ff7f0e", width=2, dash="dash")))
 
-fig.add_trace(go.Scatter(
-    x=projection_dates + projection_dates[::-1],
-    y=np.concatenate([baseline_result["p95"], baseline_result["p5"][::-1]]).tolist(),
-    fill="toself", fillcolor="rgba(255, 127, 14, 0.15)", line=dict(color="rgba(255, 127, 14, 0)"),
-    name="Run Rate 90% CI", showlegend=True,
-))
-
-if st.session_state.scenario_result is not None:
-    sr = st.session_state.scenario_result
-    sname = st.session_state.scenario_name or "Scenario"
-    fig.add_trace(go.Scatter(x=projection_dates, y=sr["median"], mode="lines", name=f"{sname} (Median)", line=dict(color="#2ca02c", width=2, dash="dot")))
     fig.add_trace(go.Scatter(
         x=projection_dates + projection_dates[::-1],
-        y=np.concatenate([sr["p95"], sr["p5"][::-1]]).tolist(),
-        fill="toself", fillcolor="rgba(44, 160, 44, 0.12)", line=dict(color="rgba(44, 160, 44, 0)"),
-        name=f"{sname} 90% CI", showlegend=True,
+        y=np.concatenate([baseline_result["p95"], baseline_result["p5"][::-1]]).tolist(),
+        fill="toself", fillcolor="rgba(255, 127, 14, 0.15)", line=dict(color="rgba(255, 127, 14, 0)"),
+        name="Run Rate 90% CI", showlegend=True,
     ))
 
-fig.update_layout(
-    title="Vello Install Base — Actuals & Projections", xaxis_title="Month", yaxis_title="Install Base (Sites)",
-    height=600, template="plotly_white",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    hovermode="x unified",
-)
-fig.add_shape(type="line", x0=latest_month.isoformat(), x1=latest_month.isoformat(), y0=0, y1=1, yref="paper", line=dict(color="gray", dash="dash"))
-fig.add_annotation(x=latest_month.isoformat(), y=1, yref="paper", text="Current", showarrow=False, yanchor="bottom")
-st.plotly_chart(fig, use_container_width=True)
+    if st.session_state.scenario_result is not None:
+        sr = st.session_state.scenario_result
+        sname = st.session_state.scenario_name or "Scenario"
+        fig.add_trace(go.Scatter(x=projection_dates, y=sr["median"], mode="lines", name=f"{sname} (Median)", line=dict(color="#2ca02c", width=2, dash="dot")))
+        fig.add_trace(go.Scatter(
+            x=projection_dates + projection_dates[::-1],
+            y=np.concatenate([sr["p95"], sr["p5"][::-1]]).tolist(),
+            fill="toself", fillcolor="rgba(44, 160, 44, 0.12)", line=dict(color="rgba(44, 160, 44, 0)"),
+            name=f"{sname} 90% CI", showlegend=True,
+        ))
+
+    fig.update_layout(
+        title="Vello Install Base — Actuals & Projections", xaxis_title="Month", yaxis_title="Install Base (Sites)",
+        height=600, template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    fig.add_shape(type="line", x0=latest_month.isoformat(), x1=latest_month.isoformat(), y0=0, y1=1, yref="paper", line=dict(color="gray", dash="dash"))
+    fig.add_annotation(x=latest_month.isoformat(), y=1, yref="paper", text="Current", showarrow=False, yanchor="bottom")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # SUMMARY TABLE
+    st.subheader("Projection Summary")
+    rows = []
+    for m in [12, 24, 36, 48, 60]:
+        if m <= projection_months:
+            date_label = (latest_month + relativedelta(months=m)).strftime("%b %Y")
+            row = {
+                "Milestone": f"+{m} months ({date_label})",
+                "Run Rate Median": f"{baseline_result['median'][m-1]:,.0f}",
+                "Run Rate 5th %ile": f"{baseline_result['p5'][m-1]:,.0f}",
+                "Run Rate 95th %ile": f"{baseline_result['p95'][m-1]:,.0f}",
+            }
+            if st.session_state.scenario_result is not None:
+                sr = st.session_state.scenario_result
+                sn = st.session_state.scenario_name or "Scenario"
+                row[f"{sn} Median"] = f"{sr['median'][m-1]:,.0f}"
+                row[f"{sn} 5th %ile"] = f"{sr['p5'][m-1]:,.0f}"
+                row[f"{sn} 95th %ile"] = f"{sr['p95'][m-1]:,.0f}"
+            rows.append(row)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 # =============================================================================
-# SUMMARY TABLE
+# TAB 2 — MONTE CARLO DISTRIBUTION
 # =============================================================================
-st.subheader("Projection Summary")
-rows = []
-for m in [12, 24, 36, 48, 60]:
-    if m <= projection_months:
-        date_label = (latest_month + relativedelta(months=m)).strftime("%b %Y")
-        row = {
-            "Milestone": f"+{m} months ({date_label})",
-            "Run Rate Median": f"{baseline_result['median'][m-1]:,.0f}",
-            "Run Rate 5th %ile": f"{baseline_result['p5'][m-1]:,.0f}",
-            "Run Rate 95th %ile": f"{baseline_result['p95'][m-1]:,.0f}",
-        }
-        if st.session_state.scenario_result is not None:
-            sr = st.session_state.scenario_result
-            sn = st.session_state.scenario_name or "Scenario"
-            row[f"{sn} Median"] = f"{sr['median'][m-1]:,.0f}"
-            row[f"{sn} 5th %ile"] = f"{sr['p5'][m-1]:,.0f}"
-            row[f"{sn} 95th %ile"] = f"{sr['p95'][m-1]:,.0f}"
-        rows.append(row)
-st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+with tab_distribution:
+    st.subheader("Simulation Distribution Analysis")
+    st.caption(f"Explore the distribution of {MONTE_CARLO_SIMULATIONS:,} simulation outcomes at any point in the projection.")
+
+    # Date selector — slider mapped to projection months
+    dist_month_idx = st.slider(
+        "Select projection month",
+        min_value=1,
+        max_value=projection_months,
+        value=12,
+        step=1,
+        key="dist_month_slider",
+        format="Month %d",
+    )
+    selected_date = latest_month + relativedelta(months=dist_month_idx)
+    st.markdown(f"**Showing distributions for: {selected_date.strftime('%B %Y')}** (month {dist_month_idx} of {projection_months})")
+
+    # Extract raw simulation values at selected month
+    rr_sims = baseline_result["raw"][:, dist_month_idx - 1]
+    has_scenario = st.session_state.scenario_result is not None
+    sc_sims = st.session_state.scenario_result["raw"][:, dist_month_idx - 1] if has_scenario else None
+    sc_name = st.session_state.scenario_name or "Scenario"
+
+    # --- Histogram ---
+    hist_fig = go.Figure()
+    hist_fig.add_trace(go.Histogram(
+        x=rr_sims,
+        name="Run Rate",
+        marker_color="rgba(255, 127, 14, 0.6)",
+        nbinsx=50,
+    ))
+    if has_scenario:
+        hist_fig.add_trace(go.Histogram(
+            x=sc_sims,
+            name=sc_name,
+            marker_color="rgba(44, 160, 44, 0.6)",
+            nbinsx=50,
+        ))
+    hist_fig.update_layout(
+        title=f"Install Base Distribution — {selected_date.strftime('%B %Y')}",
+        xaxis_title="Install Base (Sites)",
+        yaxis_title="Number of Simulations",
+        barmode="overlay",
+        height=450,
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(hist_fig, use_container_width=True)
+
+    # --- Summary Statistics Table ---
+    st.subheader("Summary Statistics")
+    percentiles = [5, 10, 25, 50, 75, 90, 95]
+
+    def _build_stats(sims, label):
+        stats = {"": label, "Mean": f"{np.mean(sims):,.0f}", "Std Dev": f"{np.std(sims):,.0f}"}
+        for p in percentiles:
+            stats[f"P{p}"] = f"{np.percentile(sims, p):,.0f}"
+        return stats
+
+    stats_rows = [_build_stats(rr_sims, "Run Rate")]
+    if has_scenario:
+        stats_rows.append(_build_stats(sc_sims, sc_name))
+    st.dataframe(pd.DataFrame(stats_rows), use_container_width=True, hide_index=True)
+
+    # --- P(Scenario beats Run Rate) ---
+    if has_scenario:
+        pct_scenario_wins = (sc_sims > rr_sims).mean() * 100
+        m1, m2, m3 = st.columns(3)
+        m1.metric("P(Scenario > Run Rate)", f"{pct_scenario_wins:.1f}%")
+        median_diff = np.median(sc_sims) - np.median(rr_sims)
+        m2.metric("Median Difference", f"{median_diff:+,.0f} sites")
+        mean_diff = np.mean(sc_sims) - np.mean(rr_sims)
+        m3.metric("Mean Difference", f"{mean_diff:+,.0f} sites")
+
+    # --- Target Probability ---
+    st.subheader("Target Analysis")
+    target_ib = st.number_input(
+        "Target Install Base",
+        min_value=0,
+        max_value=50000,
+        value=int(np.median(rr_sims)),
+        step=100,
+        key="target_ib_input",
+        help="What's the probability of reaching this install base?",
+    )
+
+    rr_pct_above = (rr_sims >= target_ib).mean() * 100
+    t1, t2 = st.columns(2)
+    t1.metric(f"P(Run Rate >= {target_ib:,})", f"{rr_pct_above:.1f}%")
+    if has_scenario:
+        sc_pct_above = (sc_sims >= target_ib).mean() * 100
+        t2.metric(f"P({sc_name} >= {target_ib:,})", f"{sc_pct_above:.1f}%")
+
+    # --- Box Plot ---
+    st.subheader("Distribution Comparison")
+    box_fig = go.Figure()
+    box_fig.add_trace(go.Box(y=rr_sims, name="Run Rate", marker_color="#ff7f0e", boxmean="sd"))
+    if has_scenario:
+        box_fig.add_trace(go.Box(y=sc_sims, name=sc_name, marker_color="#2ca02c", boxmean="sd"))
+    box_fig.update_layout(
+        title=f"Box Plot — {selected_date.strftime('%B %Y')}",
+        yaxis_title="Install Base (Sites)",
+        height=400,
+        template="plotly_white",
+    )
+    st.plotly_chart(box_fig, use_container_width=True)
 
 # =============================================================================
 # MATH DECOMPOSITION
@@ -914,52 +1027,50 @@ def _generate_analysis(run_rate_data, scenario_data, starting_ib, churn_mean, sc
     return "\n".join(lines)
 
 
-with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_result is not None):
-    run_rate_col, scenario_col = st.columns(2)
+# --- Growth Math Breakdown (inside Projections tab context) ---
+with tab_projections:
+    with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_result is not None):
+        run_rate_col, scenario_col = st.columns(2)
 
-    with run_rate_col:
-        rr_md, rr_rows, rr_gross, rr_churn_ct, rr_net = _build_math_breakdown(
-            "Run Rate", baseline_team_params, churn_mean, None, latest_ib,
-        )
-        st.markdown(rr_md)
-
-    with scenario_col:
-        if st.session_state.scenario_params is not None:
-            sp = st.session_state.scenario_params
-            sn = st.session_state.scenario_name or "Scenario"
-            sc = st.session_state.scenario_churn or churn_mean
-            sg = st.session_state.scenario_growth_rates or {}
-            sc_md, sc_rows, sc_gross, sc_churn_ct, sc_net = _build_math_breakdown(
-                sn, sp, sc, sg, latest_ib,
+        with run_rate_col:
+            rr_md, rr_rows, rr_gross, rr_churn_ct, rr_net = _build_math_breakdown(
+                "Run Rate", baseline_team_params, churn_mean, None, latest_ib,
             )
-            st.markdown(sc_md)
-        else:
-            st.info("Run a scenario to see its math breakdown here.")
+            st.markdown(rr_md)
 
-    # Natural language analysis (only when scenario exists)
-    if st.session_state.scenario_params is not None:
-        st.divider()
-        analysis = _generate_analysis(
-            (rr_rows, rr_gross, rr_churn_ct, rr_net),
-            (sc_rows, sc_gross, sc_churn_ct, sc_net),
-            latest_ib, churn_mean,
-            st.session_state.scenario_churn or churn_mean,
-        )
-        st.markdown(analysis)
+        with scenario_col:
+            if st.session_state.scenario_params is not None:
+                sp = st.session_state.scenario_params
+                sn = st.session_state.scenario_name or "Scenario"
+                sc = st.session_state.scenario_churn or churn_mean
+                sg = st.session_state.scenario_growth_rates or {}
+                sc_md, sc_rows, sc_gross, sc_churn_ct, sc_net = _build_math_breakdown(
+                    sn, sp, sc, sg, latest_ib,
+                )
+                st.markdown(sc_md)
+            else:
+                st.info("Run a scenario to see its math breakdown here.")
 
+        # Natural language analysis (only when scenario exists)
+        if st.session_state.scenario_params is not None:
+            st.divider()
+            analysis = _generate_analysis(
+                (rr_rows, rr_gross, rr_churn_ct, rr_net),
+                (sc_rows, sc_gross, sc_churn_ct, sc_net),
+                latest_ib, churn_mean,
+                st.session_state.scenario_churn or churn_mean,
+            )
+            st.markdown(analysis)
 
-# =============================================================================
-# HISTORICAL DATA EXPLORER
-# =============================================================================
-with st.expander("Historical Data Explorer"):
-    t1, t2, t3, t4, t5 = st.tabs(["Install Base", "Churns", "SQLs Created", "Conversion Rates", "Vello Attach"])
-    with t1:
-        st.dataframe(ib_df.sort_values("REPORTING_MONTH", ascending=False), use_container_width=True, hide_index=True)
-    with t2:
-        st.dataframe(data["churns"].sort_values("REPORTING_MONTH", ascending=False), use_container_width=True, hide_index=True)
-    with t3:
-        st.dataframe(data["sqls_created"].sort_values(["TEAM_NAME", "MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
-    with t4:
-        st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "COHORT_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
-    with t5:
-        st.dataframe(data["vello_attach"].sort_values(["TEAM_NAME", "CLOSE_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
+    with st.expander("Historical Data Explorer"):
+        ht1, ht2, ht3, ht4, ht5 = st.tabs(["Install Base", "Churns", "SQLs Created", "Conversion Rates", "Vello Attach"])
+        with ht1:
+            st.dataframe(ib_df.sort_values("REPORTING_MONTH", ascending=False), use_container_width=True, hide_index=True)
+        with ht2:
+            st.dataframe(data["churns"].sort_values("REPORTING_MONTH", ascending=False), use_container_width=True, hide_index=True)
+        with ht3:
+            st.dataframe(data["sqls_created"].sort_values(["TEAM_NAME", "MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
+        with ht4:
+            st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "COHORT_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
+        with ht5:
+            st.dataframe(data["vello_attach"].sort_values(["TEAM_NAME", "CLOSE_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
