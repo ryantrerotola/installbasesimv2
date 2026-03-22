@@ -698,12 +698,17 @@ def scenario_planner_modal():
         st.session_state.scenario_params = scenario_params
         st.session_state.scenario_churn = effective_churn
         st.session_state.scenario_growth_rates = growth_rates
-        st.success("Simulation complete! Close this dialog to see results on the chart.")
+        st.session_state._scenario_just_ran = True
         st.rerun()
 
 
 if st.button("Create Scenario", type="primary"):
     scenario_planner_modal()
+
+# If scenario just ran inside dialog, force full app rerun to show results
+if st.session_state.get("_scenario_just_ran"):
+    del st.session_state._scenario_just_ran
+    st.rerun()
 
 tab_projections, tab_distribution, tab_goalsek = st.tabs(["Projections", "Monte Carlo Distribution", "Goal Seek"])
 
@@ -1359,6 +1364,15 @@ with tab_goalsek:
                 seasonal_indices=seasonal_indices, start_cal_month=start_cal_month,
                 locked_levers=locked, max_iterations=15, n_sims=200,
             )
+            # Run validation simulation now (not on every rerun)
+            val_result = None
+            if recommendations:
+                rec_params, rec_churn = _build_goalsek_params(recommendations, baseline_team_params, churn_mean)
+                val_result = run_monte_carlo(
+                    latest_ib, rec_params, rec_churn, churn_std,
+                    projection_months, MONTE_CARLO_SIMULATIONS,
+                    seasonality=seasonal_indices, start_calendar_month=start_cal_month,
+                )
         st.session_state.gs_result = {
             "projected": projected,
             "recommendations": recommendations,
@@ -1367,6 +1381,7 @@ with tab_goalsek:
             "target": gs_target,
             "target_month": gs_target_month,
             "date_label": gs_date_label,
+            "val_result": val_result,
         }
 
     # --- Display results ---
@@ -1466,16 +1481,10 @@ with tab_goalsek:
             })
         st.dataframe(pd.DataFrame(sens_rows), use_container_width=True, hide_index=True)
 
-        # Validation simulation — run MC with recommended params
-        if recommendations:
+        # Validation simulation — use cached result from button click
+        val_result = gsr.get("val_result")
+        if recommendations and val_result is not None:
             st.subheader("Validation — Recommended vs Run Rate")
-            with st.spinner("Running validation simulation..."):
-                rec_params, rec_churn = _build_goalsek_params(recommendations, baseline_team_params, churn_mean)
-                val_result = run_monte_carlo(
-                    latest_ib, rec_params, rec_churn, churn_std,
-                    projection_months, MONTE_CARLO_SIMULATIONS,
-                    seasonality=seasonal_indices, start_calendar_month=start_cal_month,
-                )
 
             val_fig = go.Figure()
             val_fig.add_trace(go.Scatter(
