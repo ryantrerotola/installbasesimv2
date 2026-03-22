@@ -985,8 +985,6 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
             change_so_far = abs(allocated[id(s)])
             penalty = 1.0 + (change_so_far ** 2) * 4.0  # steeper penalty for large changes
             direction = 1.0 if (remaining_gap > 0) == (s["impact_per_pct"] > 0) else -1.0
-            if s["param"] == "churn":
-                direction = -1.0 if remaining_gap > 0 else 1.0  # reduce churn to grow
             effective_weight = abs(s["impact_per_pct"]) / penalty
             weights.append((s, effective_weight, direction))
 
@@ -1044,11 +1042,12 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
                 "unit": "%",
             }
         elif s["param"] == "churn":
-            new_val = s["current"] + change
+            # positive allocation = reduce churn (since impact_per_pct measures benefit of reduction)
+            new_val = s["current"] - change
             rec = {
                 "team": s["team"], "ls": s["ls"], "lever": s["lever"],
                 "current": round(s["current"], 3), "recommended": round(max(new_val, 0), 3),
-                "change": f"{change:+.3f}pp", "change_raw": abs(change),
+                "change": f"{-change:+.3f}pp", "change_raw": abs(change),
                 "impact": round(abs(change * s["impact_per_pct"]), 0),
                 "unit": "%",
             }
