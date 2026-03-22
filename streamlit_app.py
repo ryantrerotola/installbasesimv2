@@ -615,6 +615,12 @@ if "scenario_result" not in st.session_state:
     st.session_state.scenario_result = None
 if "scenario_name" not in st.session_state:
     st.session_state.scenario_name = ""
+if "scenario_params" not in st.session_state:
+    st.session_state.scenario_params = None
+if "scenario_churn" not in st.session_state:
+    st.session_state.scenario_churn = None
+if "scenario_growth" not in st.session_state:
+    st.session_state.scenario_growth = None
 
 
 @st.dialog("Scenario Planner", width="large")
@@ -692,6 +698,9 @@ def scenario_planner_modal():
             result = run_scenario_simulation(latest_ib, scenario_params, churn_override / 100.0, churn_std, lead_growth / 100.0, projection_months)
         st.session_state.scenario_result = result
         st.session_state.scenario_name = scenario_name
+        st.session_state.scenario_params = scenario_params
+        st.session_state.scenario_churn = churn_override / 100.0
+        st.session_state.scenario_growth = lead_growth / 100.0
         st.success("Simulation complete! Close this dialog to see results on the chart.")
         st.rerun()
 
@@ -758,6 +767,84 @@ for m in [12, 24, 36, 48, 60]:
             row[f"{sn} 95th %ile"] = f"{sr['p95'][m-1]:,.0f}"
         rows.append(row)
 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# =============================================================================
+# MATH DECOMPOSITION
+# =============================================================================
+def _build_math_breakdown(label, params, churn_rate, growth_rate, starting_ib):
+    """Build a markdown string showing the math behind a projection."""
+    lines = []
+    lines.append(f"### {label}")
+    lines.append("")
+
+    # Per team×lead_source breakdown
+    team_subtotals = {}
+    total_gross = 0.0
+    lines.append("| Team | Lead Source | SQLs/mo | Win Rate | Attach | Monthly Wins |")
+    lines.append("|------|------------|---------|----------|--------|-------------|")
+
+    for key, p in sorted(params.items(), key=lambda x: x[0]):
+        if not isinstance(key, tuple):
+            continue
+        team, ls = key
+        sqls = p.get("sqls_mean", p.get("sqls_per_month", 0))
+        cr = p.get("conv_rate", p.get("sql_conversion_rate", 0) / 100.0)
+        attach = p.get("attach_rate", p.get("vello_attach_rate", 100.0) / 100.0)
+        # Handle scenario params where rates are in % form
+        if cr > 1:
+            cr = cr / 100.0
+        if attach > 1:
+            attach = attach / 100.0
+        wins = sqls * cr * attach
+        total_gross += wins
+        team_subtotals[team] = team_subtotals.get(team, 0) + wins
+        lines.append(f"| {team} | {ls} | {sqls:.1f} | {cr*100:.1f}% | {attach*100:.0f}% | **{wins:.1f}** |")
+
+    lines.append("")
+
+    # Team subtotals
+    lines.append("**Team subtotals:** " + " + ".join(f"{t} = {w:.1f}" for t, w in team_subtotals.items()))
+    lines.append("")
+
+    # Net math
+    monthly_churn_count = starting_ib * churn_rate
+    net_monthly = total_gross - monthly_churn_count
+    lines.append(f"**Gross adds/month:** {total_gross:.1f} placements")
+    lines.append(f"")
+    lines.append(f"**Monthly churn:** {starting_ib:,} install base x {churn_rate*100:.2f}% = {monthly_churn_count:.1f} churns")
+    lines.append(f"")
+    lines.append(f"**Net monthly change:** {total_gross:.1f} - {monthly_churn_count:.1f} = **{net_monthly:+.1f}** sites/month")
+    if growth_rate != 0:
+        lines.append(f"")
+        lines.append(f"**SQL growth rate:** {growth_rate*100:.1f}%/month (compounds over time)")
+    lines.append(f"")
+    lines.append(f"**Annualized net adds (year 1, approx):** ~{net_monthly * 12:,.0f} sites")
+
+    return "\n".join(lines)
+
+
+with st.expander("Growth Math Breakdown", expanded=st.session_state.scenario_result is not None):
+    run_rate_col, scenario_col = st.columns(2)
+
+    with run_rate_col:
+        st.markdown(_build_math_breakdown(
+            "Run Rate",
+            baseline_team_params,
+            churn_mean,
+            0.0,
+            latest_ib,
+        ))
+
+    with scenario_col:
+        if st.session_state.scenario_params is not None:
+            sp = st.session_state.scenario_params
+            sn = st.session_state.scenario_name or "Scenario"
+            sc = st.session_state.scenario_churn or churn_mean
+            sg = st.session_state.scenario_growth or 0.0
+            st.markdown(_build_math_breakdown(sn, sp, sc, sg, latest_ib))
+        else:
+            st.info("Run a scenario to see its math breakdown here.")
+
 
 # =============================================================================
 # HISTORICAL DATA EXPLORER
