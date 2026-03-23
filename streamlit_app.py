@@ -982,9 +982,15 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
     if not active:
         return base_median, [], sensitivities, "no_levers"
 
-    # Allocate changes proportional to sensitivity, with quadratic cost balancing
-    # Higher sensitivity levers get more change, but penalized quadratically
-    # This naturally spreads effort across levers
+    # Realistic per-lever caps — these are the max changes the optimizer can recommend.
+    # Keeps recommendations actionable (small, incremental improvements).
+    MAX_CHANGE = {
+        "sqls": 20.0,        # ±20% change in SQLs
+        "conv_rate": 5.0,    # ±5pp change in win rate
+        "attach_rate": 10.0, # ±10pp change in attach rate
+        "churn": 0.3,        # ±0.3pp change in churn (~20% of typical rate)
+    }
+
     total_sensitivity = sum(abs(s["impact_per_pct"]) for s in active)
     if total_sensitivity == 0:
         return base_median, [], sensitivities, "no_impact"
@@ -997,16 +1003,20 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
         if abs(remaining_gap) < 1:
             break
 
-        # Weight by sensitivity / (1 + change_so_far^2) — quadratic penalty
+        # Weight by sensitivity / (1 + normalized_usage^2) — quadratic penalty
+        # normalized_usage = how much of this lever's budget we've used (0-1)
         weights = []
         for s in active:
-            change_so_far = abs(allocated[id(s)])
-            penalty = 1.0 + (change_so_far ** 2) * 4.0  # steeper penalty for large changes
+            max_chg = MAX_CHANGE.get(s["param"], 10.0)
+            usage = abs(allocated[id(s)]) / max_chg  # 0..1 fraction of budget used
+            if usage >= 1.0:
+                continue  # lever is maxed out
+            penalty = 1.0 + (usage ** 2) * 20.0  # steep penalty as lever approaches cap
             direction = 1.0 if (remaining_gap > 0) == (s["impact_per_pct"] > 0) else -1.0
             effective_weight = abs(s["impact_per_pct"]) / penalty
-            weights.append((s, effective_weight, direction))
+            weights.append((s, effective_weight, direction, max_chg))
 
-        total_weight = sum(w for _, w, _ in weights)
+        total_weight = sum(w for _, w, _, _ in weights)
         if total_weight == 0:
             break
 
@@ -1014,11 +1024,12 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
         step_fraction = min(0.3, 1.0 / max(iteration + 1, 1))
         step_gap = remaining_gap * step_fraction
 
-        for s, w, direction in weights:
+        for s, w, direction, max_chg in weights:
             share = (w / total_weight) * abs(step_gap)
             pct_change = share / abs(s["impact_per_pct"]) if abs(s["impact_per_pct"]) > 0.01 else 0
-            # Clamp individual step
-            pct_change = min(pct_change, 5.0)  # max 5 units per step
+            # Clamp to remaining headroom for this lever
+            headroom = max_chg - abs(allocated[id(s)])
+            pct_change = min(pct_change, max(headroom, 0))
             allocated[id(s)] += pct_change * direction
 
         # Re-estimate remaining gap
