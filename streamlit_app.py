@@ -1012,7 +1012,7 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
             usage = abs(allocated[id(s)]) / max_chg  # 0..1 fraction of budget used
             if usage >= 1.0:
                 continue  # lever is maxed out
-            penalty = 1.0 + (usage ** 2) * 20.0  # steep penalty as lever approaches cap
+            penalty = 1.0 + (usage ** 2) * 8.0  # penalty as lever approaches cap
             direction = 1.0 if (remaining_gap > 0) == (s["impact_per_pct"] > 0) else -1.0
             effective_weight = abs(s["impact_per_pct"]) / penalty
             weights.append((s, effective_weight, direction, max_chg))
@@ -1021,8 +1021,8 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
         if total_weight == 0:
             break
 
-        # Allocate a step — take 30% of remaining gap per iteration for stability
-        step_fraction = min(0.3, 1.0 / max(iteration + 1, 1))
+        # Allocate a step — constant fraction of remaining gap per iteration
+        step_fraction = 0.4
         step_gap = remaining_gap * step_fraction
 
         for s, w, direction, max_chg in weights:
@@ -1387,7 +1387,7 @@ with tab_goalsek:
                 baseline_team_params, churn_mean, churn_std, starting_ib=latest_ib,
                 target_ib=gs_target, target_month=gs_target_month,
                 seasonal_indices=seasonal_indices, start_cal_month=start_cal_month,
-                locked_levers=locked, max_iterations=15, n_sims=200,
+                locked_levers=locked, max_iterations=30, n_sims=200,
             )
             # Run validation simulation now (not on every rerun)
             val_result = None
