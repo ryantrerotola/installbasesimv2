@@ -1,5 +1,6 @@
 """Vello Install Base Simulator — single-file Streamlit app."""
 
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -615,8 +616,20 @@ baseline_team_params = {k: v for k, v in run_rate_params.items() if k not in ("c
 start_cal_month = latest_month.month
 
 projection_months = PROJECTION_YEARS * 12
-baseline_result = run_monte_carlo(latest_ib, baseline_team_params, churn_mean, churn_std, projection_months, seasonality=seasonal_indices, start_calendar_month=start_cal_month)
 projection_dates = [latest_month + relativedelta(months=i) for i in range(1, projection_months + 1)]
+
+# Cache baseline simulation in session state to avoid rerunning on every widget change
+_baseline_cache_key = json.dumps({
+    "ib": latest_ib, "churn": churn_mean, "churn_std": churn_std,
+    "params": {str(k): v for k, v in baseline_team_params.items()},
+    "seasonal": seasonal_indices, "cal_month": start_cal_month,
+}, sort_keys=True)
+if st.session_state.get("_baseline_cache_key") != _baseline_cache_key:
+    baseline_result = run_monte_carlo(latest_ib, baseline_team_params, churn_mean, churn_std, projection_months, seasonality=seasonal_indices, start_calendar_month=start_cal_month)
+    st.session_state._baseline_result = baseline_result
+    st.session_state._baseline_cache_key = _baseline_cache_key
+else:
+    baseline_result = st.session_state._baseline_result
 
 # Session state for scenario
 for _key in ("scenario_result", "scenario_name", "scenario_params", "scenario_churn", "scenario_growth_rates"):
