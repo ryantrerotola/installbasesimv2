@@ -982,13 +982,14 @@ def _goal_seek(baseline_params, churn_mean, churn_std, starting_ib, target_ib,
     if not active:
         return base_median, [], sensitivities, "no_levers"
 
-    # Realistic per-lever caps — these are the max changes the optimizer can recommend.
-    # Keeps recommendations actionable (small, incremental improvements).
+    # Per-lever caps — max change the optimizer can recommend per lever.
+    # Generous defaults that prevent absurd results (e.g. churn → 0%)
+    # while still allowing meaningful optimization.
     MAX_CHANGE = {
-        "sqls": 20.0,        # ±20% change in SQLs
-        "conv_rate": 5.0,    # ±5pp change in win rate
-        "attach_rate": 10.0, # ±10pp change in attach rate
-        "churn": 0.3,        # ±0.3pp change in churn (~20% of typical rate)
+        "sqls": 50.0,        # ±50% change in SQLs
+        "conv_rate": 15.0,   # ±15pp change in win rate
+        "attach_rate": 25.0, # ±25pp change in attach rate
+        "churn": 0.75,       # ±0.75pp change in churn (~50% of typical rate)
     }
 
     total_sensitivity = sum(abs(s["impact_per_pct"]) for s in active)
