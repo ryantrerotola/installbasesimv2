@@ -850,7 +850,7 @@ if st.session_state.get("_scenario_just_ran"):
     del st.session_state._scenario_just_ran
     st.rerun()
 
-tab_projections, tab_distribution, tab_goalsek = st.tabs(["Projections", "Monte Carlo Distribution", "Goal Seek"])
+tab_projections, tab_current_year, tab_distribution, tab_goalsek = st.tabs(["Projections", "Current Year", "Monte Carlo Distribution", "Goal Seek"])
 
 # =============================================================================
 # TAB 1 — PROJECTIONS
@@ -1471,7 +1471,143 @@ with tab_projections:
             st.dataframe(data["vello_attach"].sort_values(["TEAM_NAME", "CLOSE_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
 
 # =============================================================================
-# TAB 3 — GOAL SEEK
+# TAB — CURRENT YEAR
+# =============================================================================
+BUDGET_2026 = {
+    1: 1470, 2: 1586, 3: 1706, 4: 1880, 5: 2064, 6: 2266,
+    7: 2477, 8: 2688, 9: 2898, 10: 3112, 11: 3324, 12: 3532,
+}
+CURRENT_YEAR = 2026
+
+with tab_current_year:
+    st.subheader(f"{CURRENT_YEAR} Install Base — Budget vs Actuals")
+    st.caption("Track progress against the annual budget, with scenario and goal seek overlays.")
+
+    # --- Build date axis: Jan–Dec of current year ---
+    cy_dates = [pd.Timestamp(year=CURRENT_YEAR, month=m, day=1) for m in range(1, 13)]
+    budget_values = [BUDGET_2026[m] for m in range(1, 13)]
+
+    # --- Actuals: filter install base to current year ---
+    cy_actuals = ib_df[ib_df["REPORTING_MONTH"].dt.year == CURRENT_YEAR].sort_values("REPORTING_MONTH")
+
+    # --- Map projection months to current year months ---
+    # projection_dates[i] corresponds to latest_month + (i+1) months
+    # We need to find which projection indices fall within the current year
+    def _extract_cy_projection(result_dict):
+        """Extract projection values for current year months from a simulation result."""
+        proj_dates_arr = projection_dates
+        cy_proj_dates = []
+        cy_proj_median = []
+        cy_proj_p5 = []
+        cy_proj_p95 = []
+        for i, d in enumerate(proj_dates_arr):
+            if d.year == CURRENT_YEAR:
+                cy_proj_dates.append(d)
+                cy_proj_median.append(result_dict["median"][i])
+                cy_proj_p5.append(result_dict["p5"][i])
+                cy_proj_p95.append(result_dict["p95"][i])
+        return cy_proj_dates, cy_proj_median, cy_proj_p5, cy_proj_p95
+
+    cy_rr_dates, cy_rr_med, cy_rr_p5, cy_rr_p95 = _extract_cy_projection(baseline_result)
+
+    # --- Chart ---
+    cy_fig = go.Figure()
+
+    # Budget line
+    cy_fig.add_trace(go.Scatter(
+        x=cy_dates, y=budget_values, mode="lines+markers",
+        name="Budget", line=dict(color="#d62728", width=2, dash="dashdot"),
+        marker=dict(size=6, symbol="diamond"),
+    ))
+
+    # Actuals
+    if not cy_actuals.empty:
+        cy_fig.add_trace(go.Scatter(
+            x=cy_actuals["REPORTING_MONTH"], y=cy_actuals["VELLO_INSTALL_BASE"],
+            mode="lines+markers", name="Actuals",
+            line=dict(color="#1f77b4", width=3), marker=dict(size=6),
+        ))
+
+    # Run Rate projection (for current year months)
+    if cy_rr_dates:
+        cy_fig.add_trace(go.Scatter(
+            x=cy_rr_dates, y=cy_rr_med, mode="lines",
+            name="Run Rate (Median)", line=dict(color="#ff7f0e", width=2, dash="dash"),
+        ))
+        cy_fig.add_trace(go.Scatter(
+            x=cy_rr_dates + cy_rr_dates[::-1],
+            y=cy_rr_p95 + cy_rr_p5[::-1],
+            fill="toself", fillcolor="rgba(255, 127, 14, 0.12)",
+            line=dict(color="rgba(255, 127, 14, 0)"),
+            name="Run Rate 90% CI", showlegend=True,
+        ))
+
+    # Scenario line (if exists)
+    if st.session_state.scenario_result is not None:
+        sr = st.session_state.scenario_result
+        sname = st.session_state.scenario_name or "Scenario"
+        cy_sc_dates, cy_sc_med, cy_sc_p5, cy_sc_p95 = _extract_cy_projection(sr)
+        if cy_sc_dates:
+            cy_fig.add_trace(go.Scatter(
+                x=cy_sc_dates, y=cy_sc_med, mode="lines",
+                name=f"{sname} (Median)", line=dict(color="#2ca02c", width=2, dash="dot"),
+            ))
+
+    # Goal Seek line (if exists)
+    gs_val = st.session_state.get("gs_result")
+    if gs_val is not None and gs_val.get("val_result") is not None:
+        cy_gs_dates, cy_gs_med, cy_gs_p5, cy_gs_p95 = _extract_cy_projection(gs_val["val_result"])
+        if cy_gs_dates:
+            cy_fig.add_trace(go.Scatter(
+                x=cy_gs_dates, y=cy_gs_med, mode="lines",
+                name="Goal Seek (Median)", line=dict(color="#9467bd", width=2),
+            ))
+
+    cy_fig.update_layout(
+        title=f"{CURRENT_YEAR} Vello Install Base — Budget vs Actuals & Projections",
+        xaxis_title="Month", yaxis_title="Install Base (Sites)",
+        height=550, template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+        xaxis=dict(
+            dtick="M1", tickformat="%b %Y",
+            range=[pd.Timestamp(f"{CURRENT_YEAR}-01-01") - pd.Timedelta(days=10),
+                   pd.Timestamp(f"{CURRENT_YEAR}-12-31") + pd.Timedelta(days=10)],
+        ),
+    )
+    st.plotly_chart(cy_fig, use_container_width=True)
+
+    # --- Summary table: Budget vs Actuals vs Projections by month ---
+    st.subheader("Monthly Comparison")
+    cy_rows = []
+    for m in range(1, 13):
+        d = pd.Timestamp(year=CURRENT_YEAR, month=m, day=1)
+        row = {"Month": d.strftime("%b %Y"), "Budget": f"{BUDGET_2026[m]:,}"}
+
+        # Actual
+        act = cy_actuals[cy_actuals["REPORTING_MONTH"] == d]
+        if not act.empty:
+            actual_val = int(act["VELLO_INSTALL_BASE"].values[0])
+            row["Actual"] = f"{actual_val:,}"
+            row["vs Budget"] = f"{actual_val - BUDGET_2026[m]:+,}"
+        else:
+            row["Actual"] = "—"
+            row["vs Budget"] = "—"
+
+        # Run Rate projection
+        proj_match = [i for i, pd_ in enumerate(projection_dates) if pd_.year == CURRENT_YEAR and pd_.month == m]
+        if proj_match:
+            idx = proj_match[0]
+            row["Run Rate"] = f"{baseline_result['median'][idx]:,.0f}"
+        else:
+            row["Run Rate"] = "—"
+
+        cy_rows.append(row)
+
+    st.dataframe(pd.DataFrame(cy_rows), use_container_width=True, hide_index=True)
+
+# =============================================================================
+# TAB — GOAL SEEK
 # =============================================================================
 with tab_goalsek:
     st.subheader("Goal Seek — Path of Least Resistance")
