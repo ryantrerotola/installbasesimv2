@@ -17,6 +17,12 @@ PROJECTION_YEARS = 5
 MONTE_CARLO_SIMULATIONS = 1000
 CONFIDENCE_LEVEL = 0.90
 
+BAYESIAN_K = 30
+MIN_N_ATTACH = 10
+CONV_RATE_FLOOR = 0.02
+WINSORIZE_LOWER = 0.10
+WINSORIZE_UPPER = 0.90
+
 # =============================================================================
 # SQL QUERIES
 # =============================================================================
@@ -72,7 +78,6 @@ SELECT
         AND DATEDIFF('DAY', OPPORTUNITY_CREATED_DATE, CURRENT_DATE()) < 180
         THEN OPPORTUNITY_ID END)                                                            AS OPEN_ACTIVE
 FROM opps
-WHERE DATEDIFF('MONTH', OPPORTUNITY_CREATED_DATE, CURRENT_DATE()) >= 6
 GROUP BY 1, 2, 3
 ORDER BY 2, 3, 1
 """
@@ -211,6 +216,11 @@ def load_conversion_rates() -> pd.DataFrame:
     )
     combined["RESOLVED_TOTAL"] = combined["WINS"] + combined["CLOSED_LOST"] + combined["OPEN_STALE"]
     combined["CONVERSION_RATE_PCT"] = (100.0 * combined["WINS"] / combined["RESOLVED_TOTAL"].replace(0, pd.NA)).round(1)
+    combined["COHORT_MATURITY"] = np.where(
+        combined["OPEN_ACTIVE"] > combined["RESOLVED_TOTAL"] * 0.25,
+        "Immature",
+        "Mature",
+    )
     return combined
 
 
@@ -290,8 +300,10 @@ def _safe_team_monthly_total(df, team, month_col, value_col):
 
 
 def _safe_team_conv(df, team, n_cohorts=6):
-    """Volume-weighted win rate across the most recent N cohort months for a team."""
+    """Volume-weighted win rate across the most recent N mature cohort months for a team."""
     subset = df[df["TEAM_NAME"] == team]
+    if "COHORT_MATURITY" in subset.columns:
+        subset = subset[subset["COHORT_MATURITY"] == "Mature"]
     if subset.empty:
         return 0.0
     recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
@@ -310,8 +322,10 @@ def _safe_team_ls_monthly_total(df, team, lead_source, month_col, value_col):
 
 
 def _safe_team_ls_conv(df, team, lead_source, n_cohorts=6):
-    """Volume-weighted win rate across the most recent N cohort months for a team + lead source."""
+    """Volume-weighted win rate across the most recent N mature cohort months for a team + lead source."""
     subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if "COHORT_MATURITY" in subset.columns:
+        subset = subset[subset["COHORT_MATURITY"] == "Mature"]
     if subset.empty:
         return 0.0
     recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
@@ -330,8 +344,10 @@ def _safe_team_ls_mean(df, team, lead_source, col):
 
 
 def _cohort_conv_std(df, team, lead_source, n_cohorts=6):
-    """Std dev of per-cohort win rates for a team + lead source."""
+    """Std dev of per-cohort win rates for a team + lead source (mature cohorts only)."""
     subset = df[(df["TEAM_NAME"] == team) & (df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if "COHORT_MATURITY" in subset.columns:
+        subset = subset[subset["COHORT_MATURITY"] == "Mature"]
     if subset.empty:
         return 0.03
     recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
@@ -433,9 +449,83 @@ def compute_historical_defaults(data):
 # =============================================================================
 # SIMULATION ENGINE
 # =============================================================================
+def _winsorize(series, lower_pct=WINSORIZE_LOWER, upper_pct=WINSORIZE_UPPER):
+    if len(series) < 3:
+        return series
+    lo = series.quantile(lower_pct)
+    hi = series.quantile(upper_pct)
+    return series.clip(lower=lo, upper=hi)
+
+
+def _iqr_std(series):
+    if len(series) < 3:
+        return max(series.std(), 1) if len(series) > 1 else 1.0
+    q75 = series.quantile(0.75)
+    q25 = series.quantile(0.25)
+    robust = (q75 - q25) / 1.35
+    return max(robust, 1.0)
+
+
+def _bayesian_conv_rate(observed_rate, n_obs, prior_rate, k=BAYESIAN_K):
+    return (n_obs * observed_rate + k * prior_rate) / (n_obs + k)
+
+
+def _team_overall_conv(conv_df, team, n_cohorts=6):
+    subset = conv_df[conv_df["TEAM_NAME"] == team]
+    if "COHORT_MATURITY" in subset.columns:
+        subset = subset[subset["COHORT_MATURITY"] == "Mature"]
+    if subset.empty:
+        return 0.10
+    recent = subset["COHORT_MONTH"].drop_duplicates().nlargest(n_cohorts)
+    subset = subset[subset["COHORT_MONTH"].isin(recent)]
+    total_resolved = subset["RESOLVED_TOTAL"].sum()
+    return (subset["WINS"].sum() / total_resolved) if total_resolved > 0 else 0.10
+
+
+def _robust_attach_rate(attach_df, team, lead_source, n_months=6):
+    subset = attach_df[(attach_df["TEAM_NAME"] == team) & (attach_df["LEAD_SOURCE_GROUP"] == lead_source)]
+    if subset.empty:
+        team_all = attach_df[attach_df["TEAM_NAME"] == team]
+        if team_all.empty:
+            return 0.30
+        recent = team_all["CLOSE_MONTH"].drop_duplicates().nlargest(n_months)
+        team_all = team_all[team_all["CLOSE_MONTH"].isin(recent)]
+        total = team_all["TOTAL_WON"].sum()
+        vello = team_all["VELLO_WON"].sum()
+        return vello / total if total > 0 else 0.30
+    recent = subset["CLOSE_MONTH"].drop_duplicates().nlargest(n_months)
+    subset = subset[subset["CLOSE_MONTH"].isin(recent)]
+    total = subset["TOTAL_WON"].sum()
+    vello = subset["VELLO_WON"].sum()
+    if total < MIN_N_ATTACH:
+        team_all = attach_df[attach_df["TEAM_NAME"] == team]
+        recent_all = team_all["CLOSE_MONTH"].drop_duplicates().nlargest(n_months)
+        team_all = team_all[team_all["CLOSE_MONTH"].isin(recent_all)]
+        team_total = team_all["TOTAL_WON"].sum()
+        team_vello = team_all["VELLO_WON"].sum()
+        team_rate = team_vello / team_total if team_total > 0 else 0.30
+        ls_rate = vello / total if total > 0 else team_rate
+        blend_weight = total / MIN_N_ATTACH
+        return blend_weight * ls_rate + (1 - blend_weight) * team_rate
+    return vello / total if total > 0 else 0.30
+
+
+def _compute_conv_ceiling(conv_df, n_cohorts=6):
+    rates = []
+    for team in ALL_TEAMS:
+        for ls in LEAD_SOURCES:
+            r = _safe_team_ls_conv(conv_df, team, ls, n_cohorts) / 100.0
+            if r > 0:
+                rates.append(r)
+    if not rates:
+        return 0.90
+    return min(np.percentile(rates, 90), 0.95)
+
+
 def compute_run_rate_params(data):
     recent_months = 6
     params = {}
+    dq_flags = []
     sqls = data["sqls_created"]
     conv = data["conversion_rates"]
     attach_df = data["vello_attach"]
@@ -444,32 +534,68 @@ def compute_run_rate_params(data):
     ttp_recent = ttp[ttp["MONTH"] >= ttp["MONTH"].max() - pd.DateOffset(months=recent_months)]
 
     for team in ALL_TEAMS:
-        # Per-team time to implement
         team_ttp = ttp_recent[ttp_recent["TEAM_NAME"] == team] if "TEAM_NAME" in ttp_recent.columns else ttp_recent
         ttp_impl_days = team_ttp["MEDIAN_DAYS_TO_PLACEMENT"].mean() if not team_ttp.empty else 90
-
-        # Attach rate from SFDC (ISAS = 100%)
-        if team == "ISAS":
-            attach = 1.0
-        else:
-            attach = _team_ls_attach(attach_df, team, "VDC", recent_months) / 100.0  # placeholder, overridden per-ls below
 
         for ls in LEAD_SOURCES:
             ls_sqls = sqls[(sqls["TEAM_NAME"] == team) & (sqls["LEAD_SOURCE_GROUP"] == ls)]
             ls_recent = ls_sqls[ls_sqls["MONTH"] >= ls_sqls["MONTH"].max() - pd.DateOffset(months=recent_months)] if not ls_sqls.empty else ls_sqls
             monthly = ls_recent.groupby("MONTH")["SQLS_CREATED"].sum() if not ls_recent.empty else pd.Series(dtype=float)
 
+            if not monthly.empty and len(monthly) >= 3:
+                raw_mean = monthly.mean()
+                winsorized = _winsorize(monthly)
+                sqls_mean = winsorized.mean()
+                sqls_std = _iqr_std(winsorized)
+                if abs(sqls_mean - raw_mean) / max(raw_mean, 1) > 0.10:
+                    dq_flags.append({"stream": f"{team} / {ls}", "type": "SQLs Winsorized", "detail": f"Raw mean {raw_mean:.0f} -> adjusted {sqls_mean:.0f} (outliers capped at p10/p90)"})
+            elif not monthly.empty:
+                sqls_mean = monthly.mean()
+                sqls_std = max(monthly.std(), 1) if len(monthly) > 1 else 1
+                if len(monthly) <= 2:
+                    dq_flags.append({"stream": f"{team} / {ls}", "type": "Low N (SQLs)", "detail": f"Only {len(monthly)} months of data"})
+            else:
+                sqls_mean = 0
+                sqls_std = 1
+
             cr = _safe_team_ls_conv(conv, team, ls, n_cohorts=recent_months) / 100.0
             cr_std = _cohort_conv_std(conv, team, ls, n_cohorts=recent_months)
 
+            subset = conv[(conv["TEAM_NAME"] == team) & (conv["LEAD_SOURCE_GROUP"] == ls)]
+            if "COHORT_MATURITY" in subset.columns:
+                subset = subset[subset["COHORT_MATURITY"] == "Mature"]
+            recent_cohorts = subset["COHORT_MONTH"].drop_duplicates().nlargest(recent_months) if not subset.empty else pd.Series(dtype="datetime64[ns]")
+            n_resolved = subset[subset["COHORT_MONTH"].isin(recent_cohorts)]["RESOLVED_TOTAL"].sum() if not subset.empty else 0
+
+            if n_resolved < BAYESIAN_K:
+                team_prior = _team_overall_conv(conv, team, n_cohorts=recent_months)
+                adjusted_cr = _bayesian_conv_rate(cr, n_resolved, team_prior, k=BAYESIAN_K)
+                if abs(adjusted_cr - cr) > 0.02:
+                    dq_flags.append({"stream": f"{team} / {ls}", "type": "Conv Rate Adjusted (low N)", "detail": f"Raw {cr*100:.1f}% -> Bayesian {adjusted_cr*100:.1f}% (N={n_resolved}, prior={team_prior*100:.1f}%)"})
+                    cr = adjusted_cr
+
+            cr = max(cr, CONV_RATE_FLOOR)
+
             ls_ttb = ttb[(ttb["TEAM_NAME"] == team) & (ttb["LEAD_SOURCE_GROUP"] == ls) & (ttb["MONTH"] >= ttb["MONTH"].max() - pd.DateOffset(months=recent_months))]
 
-            # Per-lead-source attach for non-ISAS teams
-            ls_attach = 1.0 if team == "ISAS" else _team_ls_attach(attach_df, team, ls, recent_months) / 100.0
+            if team == "ISAS":
+                ls_attach = 1.0
+            else:
+                raw_attach = _team_ls_attach(attach_df, team, ls, recent_months) / 100.0
+                attach_subset = attach_df[(attach_df["TEAM_NAME"] == team) & (attach_df["LEAD_SOURCE_GROUP"] == ls)]
+                recent_attach = attach_subset[attach_subset["CLOSE_MONTH"].isin(attach_subset["CLOSE_MONTH"].drop_duplicates().nlargest(recent_months))] if not attach_subset.empty else attach_subset
+                attach_n = recent_attach["TOTAL_WON"].sum() if not recent_attach.empty else 0
+
+                if attach_n < MIN_N_ATTACH:
+                    ls_attach = _robust_attach_rate(attach_df, team, ls, recent_months)
+                    if abs(ls_attach - raw_attach) > 0.02:
+                        dq_flags.append({"stream": f"{team} / {ls}", "type": "Attach Rate Adjusted (low N)", "detail": f"Raw {raw_attach*100:.1f}% -> blended {ls_attach*100:.1f}% (N={attach_n}, min={MIN_N_ATTACH})"})
+                else:
+                    ls_attach = raw_attach
 
             params[(team, ls)] = {
-                "sqls_mean": monthly.mean() if not monthly.empty else 0,
-                "sqls_std": max(monthly.std(), 1) if not monthly.empty else 1,
+                "sqls_mean": sqls_mean,
+                "sqls_std": sqls_std,
                 "conv_rate": cr,
                 "conv_rate_std": cr_std,
                 "time_to_sale_days": ls_ttb["MEDIAN_DAYS_TO_BOOKING"].mean() if not ls_ttb.empty else 60,
@@ -477,7 +603,6 @@ def compute_run_rate_params(data):
                 "attach_rate": ls_attach,
             }
 
-    # Churn
     churns = data["churns"]
     ib = data["install_base"]
     if not churns.empty and not ib.empty:
@@ -489,6 +614,7 @@ def compute_run_rate_params(data):
         params["churn_rate_mean"] = 0.01
         params["churn_rate_std"] = 0.003
 
+    params["_dq_flags"] = dq_flags
     return params
 
 
@@ -612,7 +738,8 @@ defaults = compute_historical_defaults(data)
 seasonal_indices = compute_seasonality(data["time_to_booking"])
 churn_mean = run_rate_params["churn_rate_mean"]
 churn_std = run_rate_params["churn_rate_std"]
-baseline_team_params = {k: v for k, v in run_rate_params.items() if k not in ("churn_rate_mean", "churn_rate_std") and isinstance(k, tuple)}
+baseline_team_params = {k: v for k, v in run_rate_params.items() if k not in ("churn_rate_mean", "churn_rate_std", "_dq_flags") and isinstance(k, tuple)}
+dq_flags = run_rate_params.get("_dq_flags", [])
 start_cal_month = latest_month.month
 
 projection_months = PROJECTION_YEARS * 12
@@ -1315,6 +1442,20 @@ with tab_projections:
             )
             st.markdown(analysis)
 
+    if dq_flags:
+        with st.expander(f"Data Quality Flags ({len(dq_flags)} adjustments)", expanded=True):
+            st.caption("Automatic adjustments applied to handle outliers and low-sample-size issues.")
+            flag_rows = [{"Stream": f["stream"], "Adjustment": f["type"], "Details": f["detail"]} for f in dq_flags]
+            st.dataframe(pd.DataFrame(flag_rows), use_container_width=True, hide_index=True)
+            st.markdown(
+                "**Methods:** "
+                f"Winsorization at p{int(WINSORIZE_LOWER*100)}/p{int(WINSORIZE_UPPER*100)} for SQL volumes, "
+                f"Bayesian shrinkage (k={BAYESIAN_K}) for conversion rates, "
+                f"Min-N threshold ({MIN_N_ATTACH} deals) for attach rates, "
+                f"Floor at {CONV_RATE_FLOOR*100:.0f}%/ceiling at 90th pctile, "
+                "IQR-based robust std dev for Monte Carlo"
+            )
+
     with st.expander("Historical Data Explorer"):
         ht1, ht2, ht3, ht4, ht5 = st.tabs(["Install Base", "Churns", "SQLs Created", "Conversion Rates", "Vello Attach"])
         with ht1:
@@ -1324,6 +1465,7 @@ with tab_projections:
         with ht3:
             st.dataframe(data["sqls_created"].sort_values(["TEAM_NAME", "MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
         with ht4:
+            st.caption("Immature cohorts (>25% of opps still open) are shown but excluded from run rate calculations.")
             st.dataframe(data["conversion_rates"].sort_values(["TEAM_NAME", "COHORT_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
         with ht5:
             st.dataframe(data["vello_attach"].sort_values(["TEAM_NAME", "CLOSE_MONTH"], ascending=[True, False]), use_container_width=True, hide_index=True)
